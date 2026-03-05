@@ -42,6 +42,25 @@ fatal() { error "$@"; exit 1; }
 # --- Helpers ---
 command_exists() { command -v "$1" >/dev/null 2>&1; }
 
+# Copy build artifacts to target dir (skip if same directory)
+install_files() {
+    local target="$1"
+    local src_real target_real
+    src_real="$(cd "$SCRIPT_DIR" && pwd -P)"
+    target_real="$(mkdir -p "$target" && cd "$target" && pwd -P)"
+
+    if [[ "$src_real" == "$target_real" ]]; then
+        ok "Source and install dir are the same, skipping copy"
+        return
+    fi
+
+    cp build/tempest "$target/tempest"
+    chmod 755 "$target/tempest"
+    mkdir -p "$target/web"
+    rm -rf "$target/web/dist"
+    cp -r web/dist "$target/web/"
+}
+
 check_root() {
     if [[ $EUID -ne 0 ]]; then
         fatal "This script must be run as root (use sudo). Or use --standalone mode."
@@ -145,11 +164,7 @@ install_systemd() {
     mkdir -p "$INSTALL_DIR" "$DATA_DIR" "$LOG_DIR" "$CONFIG_DIR"
 
     # Copy binary and frontend
-    cp build/tempest "$INSTALL_DIR/tempest"
-    chmod 755 "$INSTALL_DIR/tempest"
-    mkdir -p "$INSTALL_DIR/web"
-    rm -rf "$INSTALL_DIR/web/dist"
-    cp -r web/dist "$INSTALL_DIR/web/"
+    install_files "$INSTALL_DIR"
 
     # Create config if not exists
     if [[ ! -f "$CONFIG_DIR/config.json" ]]; then
@@ -239,11 +254,7 @@ install_launchd() {
 
     mkdir -p "$INSTALL_DIR" "$DATA_DIR" "$LOG_DIR" "$CONFIG_DIR"
 
-    cp build/tempest "$INSTALL_DIR/tempest"
-    chmod 755 "$INSTALL_DIR/tempest"
-    mkdir -p "$INSTALL_DIR/web"
-    rm -rf "$INSTALL_DIR/web/dist"
-    cp -r web/dist "$INSTALL_DIR/web/"
+    install_files "$INSTALL_DIR"
 
     if [[ ! -f "$CONFIG_DIR/config.json" ]]; then
         cat > "$CONFIG_DIR/config.json" << CONF
@@ -309,11 +320,7 @@ install_standalone() {
     local app_dir="${HOME}/.tempest"
     mkdir -p "$app_dir/data" "$app_dir/logs"
 
-    cp build/tempest "$app_dir/tempest"
-    chmod 755 "$app_dir/tempest"
-    mkdir -p "$app_dir/web"
-    rm -rf "$app_dir/web/dist"
-    cp -r web/dist "$app_dir/web/"
+    install_files "$app_dir"
 
     if [[ ! -f "$app_dir/config.json" ]]; then
         cat > "$app_dir/config.json" << CONF
