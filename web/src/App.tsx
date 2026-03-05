@@ -141,14 +141,13 @@ export default function App() {
 
   const refresh = useCallback(async () => {
     try {
-      const [s, t, st, l, p, ifaces, sett] = await Promise.all([
+      const [s, t, st, l, p, ifaces] = await Promise.all([
         api.listSessions(),
         api.listTorrents(),
         api.getStats(),
         api.getLogs(200),
         api.listProfiles(),
         api.listInterfaces(),
-        api.getSettings(),
       ])
       setSessions(s)
       setTorrents(t)
@@ -156,7 +155,6 @@ export default function App() {
       setLogs(l)
       setProfiles(p)
       setInterfaces(ifaces)
-      setSettings(sett)
       setError(null)
     } catch (e: any) {
       setError(e.message)
@@ -165,6 +163,7 @@ export default function App() {
 
   useEffect(() => {
     refresh()
+    api.getSettings().then(setSettings).catch(() => {})
     const interval = setInterval(refresh, 5000)
     return () => clearInterval(interval)
   }, [refresh])
