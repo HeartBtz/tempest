@@ -12,6 +12,10 @@
 #
 set -euo pipefail
 
+# --- Ensure we run from the script's directory ---
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$SCRIPT_DIR"
+
 # --- Configuration ---
 APP_NAME="tempest"
 APP_USER="${TEMPEST_USER:-tempest}"
@@ -99,8 +103,10 @@ check_prerequisites() {
         echo ""
         echo "Install them and run this script again."
         echo ""
-        echo "On Debian/Ubuntu:"
-        echo "  sudo apt install -y golang-go nodejs npm gcc"
+        echo "On Debian/Ubuntu (Bookworm 12+):"
+        echo "  sudo apt install -y golang nodejs npm gcc libc6-dev"
+        echo "  # Note: golang-go may be too old on older releases."
+        echo "  # See https://go.dev/doc/install for the latest Go."
         echo ""
         echo "On RHEL/Fedora:"
         echo "  sudo dnf install -y golang nodejs npm gcc"
@@ -116,15 +122,12 @@ check_prerequisites() {
 # --- Build ---
 build_app() {
     info "Building frontend..."
-    cd web
-    npm install --silent 2>/dev/null
-    npm run build --silent 2>/dev/null
-    cd ..
+    (cd web && npm install --silent && npm run build --silent)
     ok "Frontend built"
 
     info "Building backend..."
     mkdir -p build
-    CGO_ENABLED=1 go build -ldflags "-s -w" -o build/tempest ./cmd/tempest 2>/dev/null
+    CGO_ENABLED=1 go build -ldflags "-s -w" -o build/tempest ./cmd/tempest
     ok "Backend built ($(du -sh build/tempest | cut -f1))"
 }
 
@@ -144,10 +147,9 @@ install_systemd() {
     # Copy binary and frontend
     cp build/tempest "$INSTALL_DIR/tempest"
     chmod 755 "$INSTALL_DIR/tempest"
-    cp -r web/dist "$INSTALL_DIR/web/dist" 2>/dev/null || {
-        mkdir -p "$INSTALL_DIR/web"
-        cp -r web/dist "$INSTALL_DIR/web/"
-    }
+    mkdir -p "$INSTALL_DIR/web"
+    rm -rf "$INSTALL_DIR/web/dist"
+    cp -r web/dist "$INSTALL_DIR/web/"
 
     # Create config if not exists
     if [[ ! -f "$CONFIG_DIR/config.json" ]]; then
@@ -212,10 +214,14 @@ LimitNPROC=4096
 WantedBy=multi-user.target
 UNIT
 
-    # Enable and start
+    # Enable and start (restart if already running)
     systemctl daemon-reload
     systemctl enable tempest
-    systemctl start tempest
+    if systemctl is-active --quiet tempest; then
+        systemctl restart tempest
+    else
+        systemctl start tempest
+    fi
 
     ok "Systemd service installed and started"
     echo ""
@@ -236,6 +242,7 @@ install_launchd() {
     cp build/tempest "$INSTALL_DIR/tempest"
     chmod 755 "$INSTALL_DIR/tempest"
     mkdir -p "$INSTALL_DIR/web"
+    rm -rf "$INSTALL_DIR/web/dist"
     cp -r web/dist "$INSTALL_DIR/web/"
 
     if [[ ! -f "$CONFIG_DIR/config.json" ]]; then
@@ -285,6 +292,7 @@ CONF
 </plist>
 PLIST
 
+    launchctl unload "$plist" 2>/dev/null || true
     launchctl load "$plist"
     ok "launchd service installed and started"
     echo ""
@@ -304,6 +312,7 @@ install_standalone() {
     cp build/tempest "$app_dir/tempest"
     chmod 755 "$app_dir/tempest"
     mkdir -p "$app_dir/web"
+    rm -rf "$app_dir/web/dist"
     cp -r web/dist "$app_dir/web/"
 
     if [[ ! -f "$app_dir/config.json" ]]; then
