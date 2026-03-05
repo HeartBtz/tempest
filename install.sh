@@ -217,7 +217,7 @@ NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes
-ReadWritePaths=${DATA_DIR} ${LOG_DIR}
+ReadWritePaths=${DATA_DIR} ${LOG_DIR} ${INSTALL_DIR}
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 
