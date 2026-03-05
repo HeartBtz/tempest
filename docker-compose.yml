@@ -1,0 +1,16 @@
+version: '3.8'
+
+services:
+  tempest:
+    build: .
+    container_name: tempest
+    ports:
+      - "8377:8377"
+    volumes:
+      - tempest-data:/app/data
+    environment:
+      - TEMPEST_DB_PATH=/app/data/tempest.db
+    restart: unless-stopped
+
+volumes:
+  tempest-data:
