@@ -66,8 +66,8 @@ export function CreateSessionModal({ torrents, profiles, interfaces, onClose, on
   )
 
   return (
-    <div className="modal-overlay" onClick={onClose}>
-      <div className="modal" onClick={e => e.stopPropagation()} style={{ width: 560 }}>
+    <div className="modal-overlay" onClick={e => { if (e.target === e.currentTarget) onClose() }}>
+      <div className="modal" style={{ width: 560 }}>
         <h3>⚡ New Simulation Session</h3>
         <form onSubmit={handleSubmit}>
           <div className="form-group">
