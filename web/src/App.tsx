@@ -1,11 +1,12 @@
 import { useState, useEffect, useCallback } from 'react'
-import type { Session, Torrent, GlobalStats, LogEntry, ClientProfile, NetworkInterface } from './types'
+import type { Session, Torrent, GlobalStats, LogEntry, ClientProfile, NetworkInterface, Settings } from './types'
 import * as api from './api/client'
 import { StatsBar } from './components/StatsBar'
 import { TorrentUpload } from './components/TorrentUpload'
 import { SessionList } from './components/SessionList'
 import { LogViewer } from './components/LogViewer'
 import { CreateSessionModal } from './components/CreateSessionModal'
+import { SettingsPanel } from './components/SettingsPanel'
 
 const styles = `
   * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -133,19 +134,21 @@ export default function App() {
   const [logs, setLogs] = useState<LogEntry[]>([])
   const [profiles, setProfiles] = useState<ClientProfile[]>([])
   const [interfaces, setInterfaces] = useState<NetworkInterface[]>([])
+  const [settings, setSettings] = useState<Settings | null>(null)
   const [showCreateSession, setShowCreateSession] = useState(false)
-  const [activeTab, setActiveTab] = useState<'sessions' | 'torrents' | 'logs'>('sessions')
+  const [activeTab, setActiveTab] = useState<'sessions' | 'torrents' | 'logs' | 'settings'>('sessions')
   const [error, setError] = useState<string | null>(null)
 
   const refresh = useCallback(async () => {
     try {
-      const [s, t, st, l, p, ifaces] = await Promise.all([
+      const [s, t, st, l, p, ifaces, sett] = await Promise.all([
         api.listSessions(),
         api.listTorrents(),
         api.getStats(),
         api.getLogs(200),
         api.listProfiles(),
         api.listInterfaces(),
+        api.getSettings(),
       ])
       setSessions(s)
       setTorrents(t)
@@ -153,6 +156,7 @@ export default function App() {
       setLogs(l)
       setProfiles(p)
       setInterfaces(ifaces)
+      setSettings(sett)
       setError(null)
     } catch (e: any) {
       setError(e.message)
@@ -210,22 +214,20 @@ export default function App() {
     }
   }
 
-  const handleCreateSession = async (data: {
-    torrent_id: string;
-    client_profile: string;
-    upload_speed: number;
-    download_speed: number;
-    speed_variance: number;
-    target_ratio: number;
-    stop_at_ratio: boolean;
-    max_upload: number;
-    max_download: number;
-    network_interface: string;
-  }) => {
+  const handleCreateSession = async (data: { torrent_id: string }) => {
     try {
       await api.createSession(data)
       setShowCreateSession(false)
       await refresh()
+    } catch (e: any) {
+      setError(e.message)
+    }
+  }
+
+  const handleSaveSettings = async (data: Settings) => {
+    try {
+      await api.updateSettings(data)
+      setSettings(data)
     } catch (e: any) {
       setError(e.message)
     }
@@ -258,6 +260,9 @@ export default function App() {
           </button>
           <button className={`tab ${activeTab === 'logs' ? 'active' : ''}`} onClick={() => setActiveTab('logs')}>
             📋 Logs
+          </button>
+          <button className={`tab ${activeTab === 'settings' ? 'active' : ''}`} onClick={() => setActiveTab('settings')}>
+            ⚙️ Settings
           </button>
         </div>
 
@@ -353,11 +358,18 @@ export default function App() {
           </div>
         )}
 
+        {activeTab === 'settings' && settings && (
+          <SettingsPanel
+            settings={settings}
+            profiles={profiles}
+            interfaces={interfaces}
+            onSave={handleSaveSettings}
+          />
+        )}
+
         {showCreateSession && (
           <CreateSessionModal
             torrents={torrents}
-            profiles={profiles}
-            interfaces={interfaces}
             onClose={() => setShowCreateSession(false)}
             onCreate={handleCreateSession}
           />

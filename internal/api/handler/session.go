@@ -18,17 +18,7 @@ type SessionHandler struct {
 }
 
 type CreateSessionRequest struct {
-	TorrentID        string  `json:"torrent_id"`
-	ClientProfile    string  `json:"client_profile"`
-	UploadSpeed      int64   `json:"upload_speed"`
-	DownloadSpeed    int64   `json:"download_speed"`
-	SpeedVariance    int64   `json:"speed_variance"`
-	TargetRatio      float64 `json:"target_ratio"`
-	StopAtRatio      bool    `json:"stop_at_ratio"`
-	MaxUpload        int64   `json:"max_upload"`
-	MaxDownload      int64   `json:"max_download"`
-	NetworkInterface string  `json:"network_interface"`
-	Port             int     `json:"port"`
+	TorrentID string `json:"torrent_id"`
 }
 
 type UpdateSessionRequest struct {
@@ -86,26 +76,22 @@ func (h *SessionHandler) Create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Get profile
-	profileName := req.ClientProfile
-	if profileName == "" {
-		profileName = "qbittorrent-4.6.2"
+	// Get global settings
+	settings, err := h.db.GetSettings()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "Failed to get settings")
+		return
 	}
+
+	// Get profile
+	profileName := settings.ClientProfile
 	profile, ok := client.GetProfile(profileName)
 	if !ok {
 		profile = client.DefaultProfile()
 		profileName = "qbittorrent-4.6.2"
 	}
 
-	port := req.Port
-	if port == 0 {
-		port = 6881
-	}
-
-	targetRatio := req.TargetRatio
-	if targetRatio <= 0 {
-		targetRatio = 1.0
-	}
+	port := 6881
 
 	session := &storage.Session{
 		ID:               generateID(),
@@ -118,14 +104,14 @@ func (h *SessionHandler) Create(w http.ResponseWriter, r *http.Request) {
 		Uploaded:         0,
 		Downloaded:       0,
 		Left:             torrent.Size,
-		UploadSpeed:      req.UploadSpeed,
-		DownloadSpeed:    req.DownloadSpeed,
-		SpeedVariance:    req.SpeedVariance,
-		TargetRatio:      targetRatio,
-		StopAtRatio:      req.StopAtRatio,
-		MaxUpload:        req.MaxUpload,
-		MaxDownload:      req.MaxDownload,
-		NetworkInterface: req.NetworkInterface,
+		UploadSpeed:      settings.UploadSpeed,
+		DownloadSpeed:    settings.DownloadSpeed,
+		SpeedVariance:    settings.SpeedVariance,
+		TargetRatio:      settings.TargetRatio,
+		StopAtRatio:      settings.StopAtRatio,
+		MaxUpload:        settings.MaxUpload,
+		MaxDownload:      settings.MaxDownload,
+		NetworkInterface: settings.NetworkInterface,
 		AnnounceInterval: 1800,
 		CreatedAt:        time.Now(),
 		UpdatedAt:        time.Now(),

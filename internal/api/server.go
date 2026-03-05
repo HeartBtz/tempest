@@ -37,6 +37,7 @@ func (s *Server) setupRoutes() {
 	sth := handler.NewStatsHandler(s.db, s.manager)
 	ph := handler.NewProfileHandler()
 	nh := handler.NewNetworkHandler()
+	seth := handler.NewSettingsHandler(s.db)
 
 	// API routes
 	s.mux.HandleFunc("/api/torrents", func(w http.ResponseWriter, r *http.Request) {
@@ -86,6 +87,17 @@ func (s *Server) setupRoutes() {
 
 	s.mux.HandleFunc("/api/interfaces", func(w http.ResponseWriter, r *http.Request) {
 		nh.ListInterfaces(w, r)
+	})
+
+	s.mux.HandleFunc("/api/settings", func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			seth.Get(w, r)
+		case http.MethodPut:
+			seth.Update(w, r)
+		default:
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		}
 	})
 
 	s.mux.HandleFunc("/api/logs", func(w http.ResponseWriter, r *http.Request) {

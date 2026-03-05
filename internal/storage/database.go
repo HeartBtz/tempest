@@ -81,6 +81,10 @@ func (d *Database) migrate() error {
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_sessions_torrent_id ON sessions(torrent_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_sessions_status ON sessions(status)`,
+		`CREATE TABLE IF NOT EXISTS settings (
+			key TEXT PRIMARY KEY,
+			value TEXT NOT NULL
+		)`,
 	}
 
 	for _, m := range migrations {
@@ -333,4 +337,80 @@ func (d *Database) ListTorrentsWithStats() ([]TorrentWithStats, error) {
 		torrents = append(torrents, t)
 	}
 	return torrents, rows.Err()
+}
+
+// Settings operations
+
+func (d *Database) GetSettings() (*Settings, error) {
+d.mu.RLock()
+defer d.mu.RUnlock()
+
+s := DefaultSettings()
+
+rows, err := d.db.Query(`SELECT key, value FROM settings`)
+if err != nil {
+return s, nil
+}
+defer rows.Close()
+
+for rows.Next() {
+var k, v string
+if err := rows.Scan(&k, &v); err != nil {
+continue
+}
+switch k {
+case "client_profile":
+s.ClientProfile = v
+case "upload_speed":
+fmt.Sscanf(v, "%d", &s.UploadSpeed)
+case "download_speed":
+fmt.Sscanf(v, "%d", &s.DownloadSpeed)
+case "speed_variance":
+fmt.Sscanf(v, "%d", &s.SpeedVariance)
+case "target_ratio":
+fmt.Sscanf(v, "%f", &s.TargetRatio)
+case "stop_at_ratio":
+s.StopAtRatio = v == "1"
+case "max_upload":
+fmt.Sscanf(v, "%d", &s.MaxUpload)
+case "max_download":
+fmt.Sscanf(v, "%d", &s.MaxDownload)
+case "network_interface":
+s.NetworkInterface = v
+}
+}
+
+return s, nil
+}
+
+func (d *Database) SaveSettings(s *Settings) error {
+d.mu.Lock()
+defer d.mu.Unlock()
+
+stopAtRatio := "0"
+if s.StopAtRatio {
+stopAtRatio = "1"
+}
+
+pairs := map[string]string{
+"client_profile":    s.ClientProfile,
+"upload_speed":      fmt.Sprintf("%d", s.UploadSpeed),
+"download_speed":    fmt.Sprintf("%d", s.DownloadSpeed),
+"speed_variance":    fmt.Sprintf("%d", s.SpeedVariance),
+"target_ratio":      fmt.Sprintf("%f", s.TargetRatio),
+"stop_at_ratio":     stopAtRatio,
+"max_upload":        fmt.Sprintf("%d", s.MaxUpload),
+"max_download":      fmt.Sprintf("%d", s.MaxDownload),
+"network_interface": s.NetworkInterface,
+}
+
+for k, v := range pairs {
+if _, err := d.db.Exec(
+`INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)`, k, v,
+); err != nil {
+return err
+}
+}
+
+return nil
 }

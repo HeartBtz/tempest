@@ -72,3 +72,15 @@ export interface NetworkInterface {
   flags: string;
   mtu: number;
 }
+
+export interface Settings {
+  client_profile: string;
+  upload_speed: number;
+  download_speed: number;
+  speed_variance: number;
+  target_ratio: number;
+  stop_at_ratio: boolean;
+  max_upload: number;
+  max_download: number;
+  network_interface: string;
+}

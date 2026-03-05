@@ -65,3 +65,29 @@ type TorrentWithStats struct {
 	SessionCount    int   `json:"session_count"`
 	ActiveSessions  int   `json:"active_sessions"`
 }
+
+type Settings struct {
+	ClientProfile    string  `json:"client_profile"`
+	UploadSpeed      int64   `json:"upload_speed"`
+	DownloadSpeed    int64   `json:"download_speed"`
+	SpeedVariance    int64   `json:"speed_variance"`
+	TargetRatio      float64 `json:"target_ratio"`
+	StopAtRatio      bool    `json:"stop_at_ratio"`
+	MaxUpload        int64   `json:"max_upload"`
+	MaxDownload      int64   `json:"max_download"`
+	NetworkInterface string  `json:"network_interface"`
+}
+
+func DefaultSettings() *Settings {
+	return &Settings{
+		ClientProfile:    "qbittorrent-4.6.2",
+		UploadSpeed:      102400,
+		DownloadSpeed:    0,
+		SpeedVariance:    10240,
+		TargetRatio:      2.0,
+		StopAtRatio:      false,
+		MaxUpload:        0,
+		MaxDownload:      0,
+		NetworkInterface: "",
+	}
+}

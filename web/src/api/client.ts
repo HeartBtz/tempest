@@ -1,4 +1,4 @@
-import type { Torrent, Session, GlobalStats, LogEntry, ClientProfile, NetworkInterface } from '../types';
+import type { Torrent, Session, GlobalStats, LogEntry, ClientProfile, NetworkInterface, Settings } from '../types';
 
 const BASE = '/api';
 
@@ -36,19 +36,8 @@ export const deleteTorrent = (id: string) =>
 // Sessions
 export const listSessions = () => request<Session[]>('/sessions');
 
-export const createSession = (data: {
-  torrent_id: string;
-  client_profile?: string;
-  upload_speed?: number;
-  download_speed?: number;
-  speed_variance?: number;
-  target_ratio?: number;
-  stop_at_ratio?: boolean;
-  max_upload?: number;
-  max_download?: number;
-  network_interface?: string;
-  port?: number;
-}) => request<Session>('/sessions', { method: 'POST', body: JSON.stringify(data) });
+export const createSession = (data: { torrent_id: string }) =>
+  request<Session>('/sessions', { method: 'POST', body: JSON.stringify(data) });
 
 export const startSession = (id: string) =>
   request(`/sessions/${id}/start`, { method: 'POST' });
@@ -81,3 +70,9 @@ export const listProfiles = () => request<ClientProfile[]>('/profiles');
 
 // Network interfaces
 export const listInterfaces = () => request<NetworkInterface[]>('/interfaces');
+
+// Settings
+export const getSettings = () => request<Settings>('/settings');
+
+export const updateSettings = (data: Settings) =>
+  request<Settings>('/settings', { method: 'PUT', body: JSON.stringify(data) });
