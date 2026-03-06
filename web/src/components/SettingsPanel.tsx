@@ -106,7 +106,7 @@ export function SettingsPanel({ settings, profiles, interfaces, onSave }: Props)
         </div>
 
         <div className="form-group">
-          <label>Network Interface (VPN)</label>
+          <label>Network Interface (optional)</label>
           <select value={networkInterface} onChange={e => setNetworkInterface(e.target.value)}>
             <option value="">Default (system routing)</option>
             {interfaces.map(iface => (

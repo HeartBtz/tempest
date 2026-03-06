@@ -42,7 +42,7 @@ install: all
 	./install.sh --standalone
 
 help:
-	@echo "Tempest ⚡ - BitTorrent Tracker Simulator"
+	@echo "Tempest ⚡ - BitTorrent Announce Testing Dashboard"
 	@echo ""
 	@echo "Commands:"
 	@echo "  make all          - Build frontend and backend"

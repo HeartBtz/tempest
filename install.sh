@@ -197,7 +197,7 @@ CONF
     # Create systemd unit
     cat > /etc/systemd/system/tempest.service << UNIT
 [Unit]
-Description=Tempest ⚡ BitTorrent Tracker Simulator
+Description=Tempest ⚡ BitTorrent Announce Testing Dashboard
 Documentation=https://github.com/tempest-bt/tempest
 After=network.target
 

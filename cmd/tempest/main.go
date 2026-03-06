@@ -38,7 +38,7 @@ func main() {
      ██║   ██╔══╝  ██║╚██╔╝██║██╔═══╝ ██╔══╝  ╚════██║   ██║
      ██║   ███████╗██║ ╚═╝ ██║██║     ███████╗███████║   ██║
      ╚═╝   ╚══════╝╚═╝     ╚═╝╚═╝     ╚══════╝╚══════╝   ╚═╝
-                  ⚡ BitTorrent Tracker Simulator`)
+                  ⚡ BitTorrent Announce Testing Dashboard`)
 	fmt.Printf("                        v%s\n\n", version)
 
 	// Load config

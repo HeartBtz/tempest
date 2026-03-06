@@ -237,7 +237,7 @@ export default function App() {
       <style>{styles}</style>
       <div className="app">
         <header className="header">
-          <h1>⚡ Tempest <span>v0.1.0 — BitTorrent Tracker Simulator</span></h1>
+          <h1>⚡ Tempest <span>v0.1.0 — BitTorrent Announce Testing Dashboard</span></h1>
           <button className="btn btn-primary" onClick={refresh}>↻ Refresh</button>
         </header>
 
