@@ -91,7 +91,7 @@ export function SettingsPanel({ settings, profiles, interfaces, onSave }: Props)
       <h2>
         ⚙️ Global Settings
         <span style={{ marginLeft: 'auto', fontSize: 12, color: '#666' }}>
-          Applied to all new sessions
+          Shared across all running sessions
         </span>
       </h2>
 

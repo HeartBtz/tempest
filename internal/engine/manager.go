@@ -3,6 +3,8 @@ package engine
 import (
 	"fmt"
 	"math/rand"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -16,34 +18,211 @@ type LogEntry struct {
 	Message   string    `json:"message"`
 }
 
+type speedAllocation struct {
+	upload   int64
+	download int64
+	variance int64
+}
+
 type Manager struct {
-	db       *storage.Database
-	runners  map[string]*SessionRunner
-	mu       sync.RWMutex
-	logs     []LogEntry
-	logMu    sync.RWMutex
-	maxLogs  int
-	logSubs  map[chan LogEntry]struct{}
-	subMu    sync.RWMutex
+	db            *storage.Database
+	runners       map[string]*SessionRunner
+	allocations   map[string]speedAllocation
+	allocationKey string
+	rng           *rand.Rand
+	mu            sync.RWMutex
+	logs          []LogEntry
+	logMu         sync.RWMutex
+	maxLogs       int
+	logSubs       map[chan LogEntry]struct{}
+	subMu         sync.RWMutex
 }
 
 func NewManager(db *storage.Database) *Manager {
 	return &Manager{
-		db:      db,
-		runners: make(map[string]*SessionRunner),
-		maxLogs: 1000,
-		logSubs: make(map[chan LogEntry]struct{}),
+		db:          db,
+		runners:     make(map[string]*SessionRunner),
+		allocations: make(map[string]speedAllocation),
+		rng:         rand.New(rand.NewSource(time.Now().UnixNano())),
+		maxLogs:     1000,
+		logSubs:     make(map[chan LogEntry]struct{}),
 	}
 }
 
-func (m *Manager) activeRunnerCount() int {
-	count := 0
-	for _, r := range m.runners {
+func (m *Manager) activeSessionIDs() []string {
+	ids := make([]string, 0, len(m.runners))
+	for id, r := range m.runners {
 		if r.IsRunning() {
-			count++
+			ids = append(ids, id)
 		}
 	}
-	return count
+	sort.Strings(ids)
+	return ids
+}
+
+func allocationStateKey(settings *storage.Settings, activeIDs []string) string {
+	return fmt.Sprintf("%d:%d:%d:%s",
+		settings.UploadSpeed,
+		settings.DownloadSpeed,
+		settings.SpeedVariance,
+		strings.Join(activeIDs, ","),
+	)
+}
+
+func distributeTotal(total int64, activeIDs []string, weights map[string]float64) map[string]int64 {
+	allocation := make(map[string]int64, len(activeIDs))
+	if len(activeIDs) == 0 || total <= 0 {
+		for _, id := range activeIDs {
+			allocation[id] = 0
+		}
+		return allocation
+	}
+
+	var totalWeight float64
+	for _, id := range activeIDs {
+		totalWeight += weights[id]
+	}
+	if totalWeight <= 0 {
+		base := total / int64(len(activeIDs))
+		remainder := total % int64(len(activeIDs))
+		for i, id := range activeIDs {
+			allocation[id] = base
+			if int64(i) < remainder {
+				allocation[id]++
+			}
+		}
+		return allocation
+	}
+
+	type fractionalShare struct {
+		id   string
+		frac float64
+	}
+
+	remainder := total
+	fractions := make([]fractionalShare, 0, len(activeIDs))
+	for _, id := range activeIDs {
+		exact := (float64(total) * weights[id]) / totalWeight
+		whole := int64(exact)
+		allocation[id] = whole
+		remainder -= whole
+		fractions = append(fractions, fractionalShare{
+			id:   id,
+			frac: exact - float64(whole),
+		})
+	}
+
+	sort.SliceStable(fractions, func(i, j int) bool {
+		if fractions[i].frac == fractions[j].frac {
+			return fractions[i].id < fractions[j].id
+		}
+		return fractions[i].frac > fractions[j].frac
+	})
+	for i := int64(0); i < remainder; i++ {
+		allocation[fractions[int(i)%len(fractions)].id]++
+	}
+	return allocation
+}
+
+func (m *Manager) rebalanceAllocations(settings *storage.Settings, activeIDs []string) {
+	weights := make(map[string]float64, len(activeIDs))
+	for _, id := range activeIDs {
+		weights[id] = 0.9 + m.rng.Float64()*0.2
+	}
+
+	uploads := distributeTotal(settings.UploadSpeed, activeIDs, weights)
+	downloads := distributeTotal(settings.DownloadSpeed, activeIDs, weights)
+	variances := distributeTotal(settings.SpeedVariance, activeIDs, weights)
+
+	m.allocations = make(map[string]speedAllocation, len(activeIDs))
+	for _, id := range activeIDs {
+		m.allocations[id] = speedAllocation{
+			upload:   uploads[id],
+			download: downloads[id],
+			variance: variances[id],
+		}
+	}
+}
+
+func (m *Manager) syncRunnerAllocationsLocked(activeIDs []string) {
+	activeSet := make(map[string]struct{}, len(activeIDs))
+	for _, id := range activeIDs {
+		activeSet[id] = struct{}{}
+	}
+
+	for id, runner := range m.runners {
+		allocation, ok := m.allocations[id]
+		if !ok {
+			if _, isActive := activeSet[id]; !isActive {
+				continue
+			}
+			allocation = speedAllocation{}
+		}
+
+		runner.session.UploadSpeed = allocation.upload
+		runner.session.DownloadSpeed = allocation.download
+		runner.session.SpeedVariance = allocation.variance
+		_ = m.db.UpdateSession(runner.session)
+	}
+}
+
+func (m *Manager) refreshRunnerAllocations() {
+	settings, err := m.db.GetSettings()
+	if err != nil {
+		return
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	activeIDs := m.activeSessionIDs()
+	if len(activeIDs) == 0 {
+		m.allocations = make(map[string]speedAllocation)
+		m.allocationKey = ""
+		return
+	}
+
+	m.rebalanceAllocations(settings, activeIDs)
+	m.allocationKey = allocationStateKey(settings, activeIDs)
+	m.syncRunnerAllocationsLocked(activeIDs)
+}
+
+func (m *Manager) RefreshRunnerAllocations() {
+	m.refreshRunnerAllocations()
+}
+
+func (m *Manager) getSpeedAllocation(sessionID string) (int64, int64, int64) {
+	settings, err := m.db.GetSettings()
+	if err != nil {
+		return 0, 0, 0
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	activeIDs := m.activeSessionIDs()
+	if len(activeIDs) == 0 {
+		m.allocations = make(map[string]speedAllocation)
+		m.allocationKey = ""
+		return 0, 0, 0
+	}
+
+	key := allocationStateKey(settings, activeIDs)
+	if key != m.allocationKey {
+		m.rebalanceAllocations(settings, activeIDs)
+		m.allocationKey = key
+		m.syncRunnerAllocationsLocked(activeIDs)
+	}
+
+	allocation, ok := m.allocations[sessionID]
+	if !ok {
+		m.rebalanceAllocations(settings, activeIDs)
+		m.allocationKey = key
+		m.syncRunnerAllocationsLocked(activeIDs)
+		allocation = m.allocations[sessionID]
+	}
+
+	return allocation.upload, allocation.download, allocation.variance
 }
 
 func (m *Manager) StartSession(sessionID string) error {
@@ -67,27 +246,10 @@ func (m *Manager) StartSession(sessionID string) error {
 		return fmt.Errorf("get torrent: %w", err)
 	}
 
-	// Speed allocator: reads global settings and divides by active runner count
-	// with random variation (±30%) so each session gets a different share
+	// Speed allocator: shared across all active sessions with slight variation,
+	// while preserving the configured global total.
 	speedAllocator := func() (int64, int64, int64) {
-		settings, err := m.db.GetSettings()
-		if err != nil {
-			return 0, 0, 0
-		}
-		m.mu.RLock()
-		active := m.activeRunnerCount()
-		m.mu.RUnlock()
-		if active < 1 {
-			active = 1
-		}
-		baseUp := float64(settings.UploadSpeed) / float64(active)
-		baseDown := float64(settings.DownloadSpeed) / float64(active)
-		baseVar := float64(settings.SpeedVariance) / float64(active)
-		// Random factor between 0.7 and 1.3
-		factor := 0.7 + rand.Float64()*0.6
-		return int64(baseUp * factor),
-			int64(baseDown * factor),
-			int64(baseVar * factor)
+		return m.getSpeedAllocation(sessionID)
 	}
 
 	runner, err := NewSessionRunner(session, torrent,
@@ -107,7 +269,11 @@ func (m *Manager) StartSession(sessionID string) error {
 	m.runners[sessionID] = runner
 	m.mu.Unlock()
 
-	return runner.Start()
+	if err := runner.Start(); err != nil {
+		return err
+	}
+	m.refreshRunnerAllocations()
+	return nil
 }
 
 func (m *Manager) StopSession(sessionID string) error {
@@ -126,6 +292,7 @@ func (m *Manager) StopSession(sessionID string) error {
 	}
 
 	runner.Stop()
+	m.refreshRunnerAllocations()
 	return nil
 }
 

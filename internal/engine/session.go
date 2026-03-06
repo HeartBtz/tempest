@@ -96,11 +96,22 @@ func (sr *SessionRunner) Start() error {
 		sr.session.Key = sr.profile.GenerateKey()
 	}
 
+	sr.applyAllocatedSpeeds()
 	sr.onUpdate(sr.session)
 	sr.log("info", "Session started for %s", sr.torrent.Name)
 
 	go sr.runLoop()
 	return nil
+}
+
+func (sr *SessionRunner) applyAllocatedSpeeds() {
+	if sr.speedAllocator == nil {
+		return
+	}
+	uploadSpeed, downloadSpeed, variance := sr.speedAllocator()
+	sr.session.UploadSpeed = uploadSpeed
+	sr.session.DownloadSpeed = downloadSpeed
+	sr.session.SpeedVariance = variance
 }
 
 func (sr *SessionRunner) Stop() {
@@ -115,6 +126,9 @@ func (sr *SessionRunner) Stop() {
 	close(sr.stopCh)
 
 	// Send stopped event
+	sr.session.UploadSpeed = 0
+	sr.session.DownloadSpeed = 0
+	sr.session.SpeedVariance = 0
 	sr.announce(protocol.EventStopped)
 
 	sr.session.Status = "stopped"
@@ -130,6 +144,7 @@ func (sr *SessionRunner) IsRunning() bool {
 
 func (sr *SessionRunner) runLoop() {
 	// Initial announce with "started" event
+	sr.applyAllocatedSpeeds()
 	sr.announce(protocol.EventStarted)
 
 	interval := sr.session.AnnounceInterval
@@ -170,6 +185,9 @@ func (sr *SessionRunner) runLoop() {
 				sr.mu.Lock()
 				sr.running = false
 				sr.mu.Unlock()
+				sr.session.UploadSpeed = 0
+				sr.session.DownloadSpeed = 0
+				sr.session.SpeedVariance = 0
 				sr.announce(protocol.EventStopped)
 				sr.session.Status = "completed"
 				sr.onUpdate(sr.session)
@@ -189,8 +207,10 @@ func (sr *SessionRunner) runLoop() {
 }
 
 func (sr *SessionRunner) simulateTransfer(intervalSec int) {
-	// Get allocated share of global speed
-	uploadSpeed, downloadSpeed, variance := sr.speedAllocator()
+	sr.applyAllocatedSpeeds()
+	uploadSpeed := sr.session.UploadSpeed
+	downloadSpeed := sr.session.DownloadSpeed
+	variance := sr.session.SpeedVariance
 
 	// Simulate upload
 	if uploadSpeed > 0 {

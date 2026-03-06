@@ -4,15 +4,17 @@ import (
 	"encoding/json"
 	"net/http"
 
+	"github.com/tempest-bt/tempest/internal/engine"
 	"github.com/tempest-bt/tempest/internal/storage"
 )
 
 type SettingsHandler struct {
-	db *storage.Database
+	db      *storage.Database
+	manager *engine.Manager
 }
 
-func NewSettingsHandler(db *storage.Database) *SettingsHandler {
-	return &SettingsHandler{db: db}
+func NewSettingsHandler(db *storage.Database, manager *engine.Manager) *SettingsHandler {
+	return &SettingsHandler{db: db, manager: manager}
 }
 
 func (h *SettingsHandler) Get(w http.ResponseWriter, r *http.Request) {
@@ -38,6 +40,9 @@ func (h *SettingsHandler) Update(w http.ResponseWriter, r *http.Request) {
 	if err := h.db.SaveSettings(&settings); err != nil {
 		writeError(w, http.StatusInternalServerError, "Failed to save settings")
 		return
+	}
+	if h.manager != nil {
+		h.manager.RefreshRunnerAllocations()
 	}
 
 	writeJSON(w, http.StatusOK, settings)

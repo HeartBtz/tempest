@@ -34,7 +34,7 @@ export function SessionList({ sessions, onStart, onStop, onDelete, formatBytes, 
             <th>Uploaded</th>
             <th>Downloaded</th>
             <th>Ratio</th>
-            <th>Speed ↑/↓</th>
+            <th>Allocated ↑/↓</th>
             <th>Variance</th>
             <th>Limits</th>
             <th>S/L</th>

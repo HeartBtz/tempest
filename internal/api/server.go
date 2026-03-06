@@ -37,7 +37,7 @@ func (s *Server) setupRoutes() {
 	sth := handler.NewStatsHandler(s.db, s.manager)
 	ph := handler.NewProfileHandler()
 	nh := handler.NewNetworkHandler()
-	seth := handler.NewSettingsHandler(s.db)
+	seth := handler.NewSettingsHandler(s.db, s.manager)
 
 	// API routes
 	s.mux.HandleFunc("/api/torrents", func(w http.ResponseWriter, r *http.Request) {
