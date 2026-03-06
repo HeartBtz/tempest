@@ -35,6 +35,16 @@ func NewManager(db *storage.Database) *Manager {
 	}
 }
 
+func (m *Manager) activeRunnerCount() int {
+	count := 0
+	for _, r := range m.runners {
+		if r.IsRunning() {
+			count++
+		}
+	}
+	return count
+}
+
 func (m *Manager) StartSession(sessionID string) error {
 	m.mu.Lock()
 
@@ -56,6 +66,23 @@ func (m *Manager) StartSession(sessionID string) error {
 		return fmt.Errorf("get torrent: %w", err)
 	}
 
+	// Speed allocator: reads global settings and divides by active runner count
+	speedAllocator := func() (int64, int64, int64) {
+		settings, err := m.db.GetSettings()
+		if err != nil {
+			return 0, 0, 0
+		}
+		m.mu.RLock()
+		active := m.activeRunnerCount()
+		m.mu.RUnlock()
+		if active < 1 {
+			active = 1
+		}
+		return settings.UploadSpeed / int64(active),
+			settings.DownloadSpeed / int64(active),
+			settings.SpeedVariance / int64(active)
+	}
+
 	runner, err := NewSessionRunner(session, torrent,
 		func(s *storage.Session) {
 			m.db.UpdateSession(s)
@@ -63,6 +90,7 @@ func (m *Manager) StartSession(sessionID string) error {
 		func(level, msg string) {
 			m.addLog(sessionID, level, msg)
 		},
+		speedAllocator,
 	)
 	if err != nil {
 		m.mu.Unlock()

@@ -13,19 +13,20 @@ import (
 )
 
 type SessionRunner struct {
-	session       *storage.Session
-	torrent       *storage.Torrent
-	profile       client.Profile
-	tracker       *protocol.TrackerClient
-	randomizer    *client.Randomizer
-	infoHash      [20]byte
-	trackers      []string
-	stopCh        chan struct{}
-	running       bool
-	completedSent bool
-	mu            sync.Mutex
-	onUpdate      func(*storage.Session)
-	onLog         func(string, string) // level, message
+	session        *storage.Session
+	torrent        *storage.Torrent
+	profile        client.Profile
+	tracker        *protocol.TrackerClient
+	randomizer     *client.Randomizer
+	infoHash       [20]byte
+	trackers       []string
+	stopCh         chan struct{}
+	running        bool
+	completedSent  bool
+	mu             sync.Mutex
+	onUpdate       func(*storage.Session)
+	onLog          func(string, string)
+	speedAllocator func() (uploadSpeed, downloadSpeed, variance int64)
 }
 
 func NewSessionRunner(
@@ -33,6 +34,7 @@ func NewSessionRunner(
 	torrent *storage.Torrent,
 	onUpdate func(*storage.Session),
 	onLog func(string, string),
+	speedAllocator func() (int64, int64, int64),
 ) (*SessionRunner, error) {
 	profile, ok := client.GetProfile(session.ClientProfile)
 	if !ok {
@@ -62,16 +64,17 @@ func NewSessionRunner(
 	}
 
 	return &SessionRunner{
-		session:    session,
-		torrent:    torrent,
-		profile:    profile,
-		tracker:    tracker,
-		randomizer: client.NewRandomizer(true),
-		infoHash:   infoHash,
-		trackers:   trackers,
-		stopCh:     make(chan struct{}),
-		onUpdate:   onUpdate,
-		onLog:      onLog,
+		session:        session,
+		torrent:        torrent,
+		profile:        profile,
+		tracker:        tracker,
+		randomizer:     client.NewRandomizer(true),
+		infoHash:       infoHash,
+		trackers:       trackers,
+		stopCh:         make(chan struct{}),
+		onUpdate:       onUpdate,
+		onLog:          onLog,
+		speedAllocator: speedAllocator,
 	}, nil
 }
 
@@ -186,15 +189,16 @@ func (sr *SessionRunner) runLoop() {
 }
 
 func (sr *SessionRunner) simulateTransfer(intervalSec int) {
-	variance := sr.session.SpeedVariance
+	// Get allocated share of global speed
+	uploadSpeed, downloadSpeed, variance := sr.speedAllocator()
 
 	// Simulate upload
-	if sr.session.UploadSpeed > 0 {
+	if uploadSpeed > 0 {
 		// Check max upload limit
 		if sr.session.MaxUpload > 0 && sr.session.Uploaded >= sr.session.MaxUpload {
 			sr.log("info", "Max upload limit reached (%d bytes)", sr.session.MaxUpload)
 		} else {
-			uploadDelta := sr.randomizer.SimulateUploadDelta(sr.session.UploadSpeed, variance, intervalSec)
+			uploadDelta := sr.randomizer.SimulateUploadDelta(uploadSpeed, variance, intervalSec)
 			// Cap at max upload limit
 			if sr.session.MaxUpload > 0 {
 				remaining := sr.session.MaxUpload - sr.session.Uploaded
@@ -207,12 +211,12 @@ func (sr *SessionRunner) simulateTransfer(intervalSec int) {
 	}
 
 	// Simulate download
-	if sr.session.DownloadSpeed > 0 && sr.session.Left > 0 {
+	if downloadSpeed > 0 && sr.session.Left > 0 {
 		// Check max download limit
 		if sr.session.MaxDownload > 0 && sr.session.Downloaded >= sr.session.MaxDownload {
 			sr.log("info", "Max download limit reached (%d bytes)", sr.session.MaxDownload)
 		} else {
-			downloadDelta := sr.randomizer.SimulateDownloadDelta(sr.session.DownloadSpeed, variance, intervalSec, sr.session.Left)
+			downloadDelta := sr.randomizer.SimulateDownloadDelta(downloadSpeed, variance, intervalSec, sr.session.Left)
 			// Cap at max download limit
 			if sr.session.MaxDownload > 0 {
 				remaining := sr.session.MaxDownload - sr.session.Downloaded
