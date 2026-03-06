@@ -2,6 +2,7 @@ package engine
 
 import (
 	"fmt"
+	"math/rand"
 	"sync"
 	"time"
 
@@ -67,6 +68,7 @@ func (m *Manager) StartSession(sessionID string) error {
 	}
 
 	// Speed allocator: reads global settings and divides by active runner count
+	// with random variation (±30%) so each session gets a different share
 	speedAllocator := func() (int64, int64, int64) {
 		settings, err := m.db.GetSettings()
 		if err != nil {
@@ -78,9 +80,14 @@ func (m *Manager) StartSession(sessionID string) error {
 		if active < 1 {
 			active = 1
 		}
-		return settings.UploadSpeed / int64(active),
-			settings.DownloadSpeed / int64(active),
-			settings.SpeedVariance / int64(active)
+		baseUp := float64(settings.UploadSpeed) / float64(active)
+		baseDown := float64(settings.DownloadSpeed) / float64(active)
+		baseVar := float64(settings.SpeedVariance) / float64(active)
+		// Random factor between 0.7 and 1.3
+		factor := 0.7 + rand.Float64()*0.6
+		return int64(baseUp * factor),
+			int64(baseDown * factor),
+			int64(baseVar * factor)
 	}
 
 	runner, err := NewSessionRunner(session, torrent,
