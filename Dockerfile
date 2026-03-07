@@ -17,7 +17,7 @@ COPY --from=frontend /app/web/dist ./web/dist
 RUN CGO_ENABLED=1 go build -ldflags "-s -w" -o tempest ./cmd/tempest
 
 # Runtime
-FROM alpine:3.19
+FROM alpine:3.23
 RUN apk add --no-cache ca-certificates
 WORKDIR /app
 COPY --from=backend /app/tempest .
