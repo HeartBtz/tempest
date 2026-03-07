@@ -1,5 +1,5 @@
 # Build frontend
-FROM node:18-alpine AS frontend
+FROM node:25-alpine AS frontend
 WORKDIR /app/web
 COPY web/package*.json ./
 RUN npm ci
