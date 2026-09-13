@@ -27,6 +27,18 @@ export interface Torrent {
   category_name?: string | null;
 }
 
+export interface UploadResult {
+  filename: string;
+  status: 'started' | 'saved' | 'skipped' | 'error';
+  torrent?: Torrent;
+  session_id?: string;
+  error?: string;
+}
+
+export interface UploadResponse {
+  results: UploadResult[];
+}
+
 export interface Session {
   id: string;
   torrent_id: string;

@@ -3,6 +3,8 @@ package config
 import (
 	"bufio"
 	"encoding/json"
+	"net"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -33,7 +35,9 @@ type EngineConfig struct {
 }
 
 type SecurityConfig struct {
-	AllowPrivateTrackerDestinations bool `json:"allow_private_tracker_destinations"`
+	AllowPrivateTrackerDestinations bool     `json:"allow_private_tracker_destinations"`
+	AllowedHosts                    []string `json:"allowed_hosts,omitempty"`
+	AllowedOrigins                  []string `json:"allowed_origins,omitempty"`
 }
 
 var (
@@ -128,6 +132,105 @@ func applyEnvOverrides(cfg *Config) {
 	if v := os.Getenv("TEMPEST_ALLOW_PRIVATE_TRACKERS"); v != "" {
 		cfg.Security.AllowPrivateTrackerDestinations = v == "true" || v == "1" || v == "yes"
 	}
+	if v, ok := os.LookupEnv("TEMPEST_ALLOWED_HOSTS"); ok {
+		cfg.Security.AllowedHosts = parseAllowedHosts(v)
+	}
+	if v, ok := os.LookupEnv("TEMPEST_ALLOWED_ORIGINS"); ok {
+		cfg.Security.AllowedOrigins = parseAllowedOrigins(v)
+	}
+}
+
+func parseAllowedHosts(value string) []string {
+	hosts := make([]string, 0)
+	seen := make(map[string]struct{})
+	for _, item := range strings.Split(value, ",") {
+		host := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(item), "."))
+		if !validAllowedHost(host) {
+			continue
+		}
+		if _, exists := seen[host]; exists {
+			continue
+		}
+		seen[host] = struct{}{}
+		hosts = append(hosts, host)
+	}
+	return hosts
+}
+
+func validAllowedHost(host string) bool {
+	if host == "" {
+		return false
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return !ip.IsUnspecified()
+	}
+	if len(host) > 253 || strings.ContainsAny(host, ":/@[] \\") {
+		return false
+	}
+	for _, label := range strings.Split(host, ".") {
+		if len(label) == 0 || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
+			return false
+		}
+		for _, char := range label {
+			if char > 127 || char != '-' && (char < 'a' || char > 'z') && (char < '0' || char > '9') {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func parseAllowedOrigins(value string) []string {
+	origins := make([]string, 0)
+	seen := make(map[string]struct{})
+	for _, item := range strings.Split(value, ",") {
+		origin, ok := normalizeOrigin(strings.TrimSpace(item))
+		if !ok {
+			continue
+		}
+		if _, exists := seen[origin]; exists {
+			continue
+		}
+		seen[origin] = struct{}{}
+		origins = append(origins, origin)
+	}
+	return origins
+}
+
+func normalizeOrigin(value string) (string, bool) {
+	parsed, err := url.Parse(value)
+	if err != nil || parsed.Opaque != "" || parsed.User != nil || parsed.Host == "" ||
+		parsed.Path != "" || parsed.RawPath != "" || parsed.RawQuery != "" || parsed.ForceQuery || parsed.Fragment != "" {
+		return "", false
+	}
+	scheme := strings.ToLower(parsed.Scheme)
+	if scheme != "http" && scheme != "https" {
+		return "", false
+	}
+	host := strings.ToLower(strings.TrimSuffix(parsed.Hostname(), "."))
+	if !validAllowedHost(host) {
+		return "", false
+	}
+	port := parsed.Port()
+	if strings.HasSuffix(parsed.Host, ":") || port != "" && !validPort(port) {
+		return "", false
+	}
+	if scheme == "http" && port == "80" || scheme == "https" && port == "443" {
+		port = ""
+	}
+	authority := host
+	if net.ParseIP(host) != nil {
+		authority = "[" + host + "]"
+	}
+	if port != "" {
+		authority = net.JoinHostPort(host, port)
+	}
+	return scheme + "://" + authority, true
+}
+
+func validPort(port string) bool {
+	n, err := strconv.Atoi(port)
+	return err == nil && n >= 1 && n <= 65535 && strconv.Itoa(n) == port
 }
 
 func Load(path string) (*Config, error) {

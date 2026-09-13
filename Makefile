@@ -1,4 +1,4 @@
-.PHONY: all build run clean frontend backend dev install
+.PHONY: all build run clean frontend backend dev install test
 
 VERSION := 0.1.0
 BINARY := tempest
@@ -36,6 +36,9 @@ docker:
 
 test:
 	go test ./...
+	@node -e 'if (process.versions.node.split(".")[0] !== "24") { console.error("Node.js 24.x is required"); process.exit(1) }'
+	cd web && npm ci && npm test && npm run build
+	tests/install-static.sh
 
 install: all
 	@echo "⚡ Running install script..."
@@ -53,5 +56,5 @@ help:
 	@echo "  make dev-frontend - Run frontend in dev mode"
 	@echo "  make clean        - Clean build artifacts"
 	@echo "  make docker       - Build Docker image"
-	@echo "  make test         - Run tests"
+	@echo "  make test         - Run backend, frontend, build, and installer checks"
 	@echo "  make install      - Build & install (standalone)"

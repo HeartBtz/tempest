@@ -33,8 +33,9 @@ func (h *SettingsHandler) Update(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if settings.TargetRatio <= 0 {
-		settings.TargetRatio = 1.0
+	if err := validateSettings(&settings); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
 	}
 
 	if err := h.db.SaveSettings(&settings); err != nil {

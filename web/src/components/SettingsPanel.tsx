@@ -5,7 +5,7 @@ interface Props {
   settings: Settings
   profiles: ClientProfile[]
   interfaces: NetworkInterface[]
-  onSave: (settings: Settings) => void
+  onSave: (settings: Settings) => Promise<void>
 }
 
 const unitOptions = [
@@ -41,6 +41,8 @@ export function SettingsPanel({ settings, profiles, interfaces, onSave }: Props)
   const [maxDownloadUnit, setMaxDownloadUnit] = useState(1073741824)
   const [networkInterface, setNetworkInterface] = useState('')
   const [saved, setSaved] = useState(false)
+  const [saving, setSaving] = useState(false)
+  const [saveError, setSaveError] = useState<string | null>(null)
 
   useEffect(() => {
     setClientProfile(settings.client_profile)
@@ -64,20 +66,29 @@ export function SettingsPanel({ settings, profiles, interfaces, onSave }: Props)
     setNetworkInterface(settings.network_interface)
   }, [settings])
 
-  const handleSave = () => {
-    onSave({
-      client_profile: clientProfile,
-      upload_speed: Math.round((parseFloat(uploadSpeed) || 0) * uploadSpeedUnit),
-      download_speed: Math.round((parseFloat(downloadSpeed) || 0) * downloadSpeedUnit),
-      speed_variance: Math.round((parseFloat(speedVariance) || 0) * speedVarianceUnit),
-      target_ratio: parseFloat(targetRatio) || 1.0,
-      stop_at_ratio: stopAtRatio,
-      max_upload: Math.round((parseFloat(maxUpload) || 0) * maxUploadUnit),
-      max_download: Math.round((parseFloat(maxDownload) || 0) * maxDownloadUnit),
-      network_interface: networkInterface,
-    })
-    setSaved(true)
-    setTimeout(() => setSaved(false), 2000)
+  const handleSave = async () => {
+    setSaving(true)
+    setSaved(false)
+    setSaveError(null)
+    try {
+      await onSave({
+        client_profile: clientProfile,
+        upload_speed: Math.round((parseFloat(uploadSpeed) || 0) * uploadSpeedUnit),
+        download_speed: Math.round((parseFloat(downloadSpeed) || 0) * downloadSpeedUnit),
+        speed_variance: Math.round((parseFloat(speedVariance) || 0) * speedVarianceUnit),
+        target_ratio: parseFloat(targetRatio) || 1.0,
+        stop_at_ratio: stopAtRatio,
+        max_upload: Math.round((parseFloat(maxUpload) || 0) * maxUploadUnit),
+        max_download: Math.round((parseFloat(maxDownload) || 0) * maxDownloadUnit),
+        network_interface: networkInterface,
+      })
+      setSaved(true)
+      setTimeout(() => setSaved(false), 2000)
+    } catch (error) {
+      setSaveError(error instanceof Error ? error.message : 'Failed to save settings')
+    } finally {
+      setSaving(false)
+    }
   }
 
   const UnitSelect = ({ value, onChange }: { value: number; onChange: (v: number) => void }) => (
@@ -173,8 +184,9 @@ export function SettingsPanel({ settings, profiles, interfaces, onSave }: Props)
       </div>
 
       <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginTop: 16 }}>
-        <button className="btn btn-primary" onClick={handleSave}>💾 Save Settings</button>
+        <button className="btn btn-primary" onClick={handleSave} disabled={saving}>{saving ? 'Saving…' : '💾 Save Settings'}</button>
         {saved && <span style={{ color: '#22c55e', fontSize: 13 }}>✓ Settings saved</span>}
+        {saveError && <span style={{ color: '#ef4444', fontSize: 13 }}>{saveError}</span>}
       </div>
     </div>
   )

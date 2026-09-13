@@ -1,13 +1,14 @@
 import { useRef, useState } from 'react'
+import type { UploadResponse } from '../types'
 
 interface UploadStatus {
   name: string
-  status: 'uploading' | 'done' | 'error' | 'skipped'
+  status: 'uploading' | 'started' | 'saved' | 'error' | 'skipped'
   error?: string
 }
 
 interface Props {
-  onUpload: (files: File[]) => Promise<void>
+  onUpload: (files: File[]) => Promise<UploadResponse>
 }
 
 export function TorrentUpload({ onUpload }: Props) {
@@ -21,10 +22,15 @@ export function TorrentUpload({ onUpload }: Props) {
 
     setStatuses(torrentFiles.map(f => ({ name: f.name, status: 'uploading' })))
     try {
-      await onUpload(torrentFiles)
-      setStatuses(torrentFiles.map(f => ({ name: f.name, status: 'done' })))
-    } catch (e: any) {
-      setStatuses(torrentFiles.map(f => ({ name: f.name, status: 'error', error: e.message })))
+      const response = await onUpload(torrentFiles)
+      setStatuses(response.results.map(result => ({
+        name: result.filename,
+        status: result.status,
+        error: result.error,
+      })))
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Upload failed'
+      setStatuses(torrentFiles.map(f => ({ name: f.name, status: 'error', error: message })))
     }
     setTimeout(() => setStatuses([]), 4000)
   }
@@ -69,13 +75,16 @@ export function TorrentUpload({ onUpload }: Props) {
             <div key={i} style={{
               display: 'flex', alignItems: 'center', gap: 8,
               fontSize: 12, padding: '4px 8px', borderRadius: 6,
-              background: s.status === 'done' ? '#22c55e11' : s.status === 'error' ? '#ef444411' : '#ffd70011',
-              border: `1px solid ${s.status === 'done' ? '#22c55e33' : s.status === 'error' ? '#ef444433' : '#ffd70033'}`,
+              background: s.status === 'started' ? '#22c55e11' : s.status === 'error' ? '#ef444411' : '#ffd70011',
+              border: `1px solid ${s.status === 'started' ? '#22c55e33' : s.status === 'error' ? '#ef444433' : '#ffd70033'}`,
             }}>
-              <span>{s.status === 'uploading' ? '⏳' : s.status === 'done' ? '✓' : s.status === 'skipped' ? '⚠' : '✕'}</span>
+              <span>{s.status === 'uploading' ? '…' : s.status === 'started' ? '✓' : s.status === 'error' ? '✕' : '!'}</span>
               <span style={{ color: '#ccc', flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{s.name}</span>
               {s.error && <span style={{ color: '#ef4444' }}>{s.error}</span>}
-              {s.status === 'done' && <span style={{ color: '#22c55e' }}>Started</span>}
+              {s.status === 'started' && <span style={{ color: '#22c55e' }}>Started</span>}
+              {s.status === 'saved' && <span style={{ color: '#f59e0b' }}>Saved, not started</span>}
+              {s.status === 'skipped' && <span style={{ color: '#f59e0b' }}>Skipped</span>}
+              {s.status === 'error' && <span style={{ color: '#ef4444' }}>Error</span>}
             </div>
           ))}
         </div>

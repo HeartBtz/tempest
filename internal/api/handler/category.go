@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"database/sql"
 	"encoding/json"
 	"log"
 	"net/http"
@@ -34,12 +35,28 @@ func (h *CategoryHandler) List(w http.ResponseWriter, r *http.Request) {
 }
 
 type CreateCategoryRequest struct {
-	Name          string  `json:"name"`
-	Color         string  `json:"color"`
-	UploadSpeed   int64   `json:"upload_speed"`
-	DownloadSpeed int64   `json:"download_speed"`
-	SpeedVariance int64   `json:"speed_variance"`
-	TargetRatio   float64 `json:"target_ratio"`
+	Name          string   `json:"name"`
+	Color         string   `json:"color"`
+	UploadSpeed   int64    `json:"upload_speed"`
+	DownloadSpeed int64    `json:"download_speed"`
+	SpeedVariance int64    `json:"speed_variance"`
+	TargetRatio   *float64 `json:"target_ratio"`
+}
+
+func (req *CreateCategoryRequest) validate() error {
+	if err := validateSpeed("upload_speed", req.UploadSpeed); err != nil {
+		return err
+	}
+	if err := validateSpeed("download_speed", req.DownloadSpeed); err != nil {
+		return err
+	}
+	if err := validateSpeed("speed_variance", req.SpeedVariance); err != nil {
+		return err
+	}
+	if req.TargetRatio != nil {
+		return validateTargetRatio(*req.TargetRatio)
+	}
+	return nil
 }
 
 func (h *CategoryHandler) Create(w http.ResponseWriter, r *http.Request) {
@@ -55,10 +72,15 @@ func (h *CategoryHandler) Create(w http.ResponseWriter, r *http.Request) {
 	if req.Color == "" {
 		req.Color = "#6366f1"
 	}
-	if req.TargetRatio <= 0 {
-		req.TargetRatio = 2.0
+	if err := req.validate(); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
 	}
 
+	targetRatio := 2.0
+	if req.TargetRatio != nil {
+		targetRatio = *req.TargetRatio
+	}
 	cat := &storage.Category{
 		ID:            generateID(),
 		Name:          strings.TrimSpace(req.Name),
@@ -66,7 +88,7 @@ func (h *CategoryHandler) Create(w http.ResponseWriter, r *http.Request) {
 		UploadSpeed:   req.UploadSpeed,
 		DownloadSpeed: req.DownloadSpeed,
 		SpeedVariance: req.SpeedVariance,
-		TargetRatio:   req.TargetRatio,
+		TargetRatio:   targetRatio,
 		CreatedAt:     time.Now(),
 	}
 
@@ -138,6 +160,10 @@ func (h *CategoryHandler) Update(w http.ResponseWriter, r *http.Request, id stri
 		writeError(w, http.StatusBadRequest, "Invalid request body")
 		return
 	}
+	if err := req.validate(); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	if strings.TrimSpace(req.Name) != "" {
 		cat.Name = strings.TrimSpace(req.Name)
 	}
@@ -147,11 +173,15 @@ func (h *CategoryHandler) Update(w http.ResponseWriter, r *http.Request, id stri
 	cat.UploadSpeed = req.UploadSpeed
 	cat.DownloadSpeed = req.DownloadSpeed
 	cat.SpeedVariance = req.SpeedVariance
-	if req.TargetRatio > 0 {
-		cat.TargetRatio = req.TargetRatio
+	if req.TargetRatio != nil {
+		cat.TargetRatio = *req.TargetRatio
 	}
 
 	if err := h.db.UpdateCategory(cat); err != nil {
+		if err == sql.ErrNoRows {
+			writeError(w, http.StatusNotFound, "Category not found")
+			return
+		}
 		writeError(w, http.StatusInternalServerError, "Failed to update category")
 		return
 	}
@@ -162,6 +192,10 @@ func (h *CategoryHandler) Update(w http.ResponseWriter, r *http.Request, id stri
 
 func (h *CategoryHandler) Delete(w http.ResponseWriter, r *http.Request, id string) {
 	if err := h.db.DeleteCategory(id); err != nil {
+		if err == sql.ErrNoRows {
+			writeError(w, http.StatusNotFound, "Category not found")
+			return
+		}
 		writeError(w, http.StatusInternalServerError, "Failed to delete category")
 		return
 	}
@@ -180,8 +214,20 @@ func (h *CategoryHandler) Assign(w http.ResponseWriter, r *http.Request, id stri
 		writeError(w, http.StatusBadRequest, "Invalid request body")
 		return
 	}
+	if len(req.TorrentIDs) == 0 {
+		writeError(w, http.StatusBadRequest, "torrent_ids must contain at least one ID")
+		return
+	}
+	if _, err := h.db.GetCategory(id); err != nil {
+		writeError(w, http.StatusNotFound, "Category not found")
+		return
+	}
 	catID := &id
 	if err := h.db.AssignTorrentsToCategory(req.TorrentIDs, catID); err != nil {
+		if err == sql.ErrNoRows {
+			writeError(w, http.StatusNotFound, "Torrent not found")
+			return
+		}
 		writeError(w, http.StatusInternalServerError, "Failed to assign torrents")
 		return
 	}
@@ -196,7 +242,15 @@ func (h *CategoryHandler) Unassign(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "Invalid request body")
 		return
 	}
+	if len(req.TorrentIDs) == 0 {
+		writeError(w, http.StatusBadRequest, "torrent_ids must contain at least one ID")
+		return
+	}
 	if err := h.db.AssignTorrentsToCategory(req.TorrentIDs, nil); err != nil {
+		if err == sql.ErrNoRows {
+			writeError(w, http.StatusNotFound, "Torrent not found")
+			return
+		}
 		writeError(w, http.StatusInternalServerError, "Failed to unassign torrents")
 		return
 	}

@@ -2,6 +2,7 @@ package handler
 
 import (
 	"bytes"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -60,12 +61,17 @@ func (h *TorrentHandler) Get(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, torrent)
 }
 
-type uploadResult struct {
-	Torrent   *storage.Torrent `json:"torrent"`
-	SessionID string           `json:"session_id,omitempty"`
-	Error     string           `json:"error,omitempty"`
-	Skipped   bool             `json:"skipped,omitempty"`
-	TooLarge  bool             `json:"-"`
+type UploadResult struct {
+	Filename   string           `json:"filename"`
+	Status     string           `json:"status"`
+	Torrent    *storage.Torrent `json:"torrent,omitempty"`
+	SessionID  string           `json:"session_id,omitempty"`
+	Error      string           `json:"error,omitempty"`
+	httpStatus int
+}
+
+type UploadResponse struct {
+	Results []UploadResult `json:"results"`
 }
 
 // Create handles POST /api/torrents.
@@ -88,53 +94,47 @@ func (h *TorrentHandler) Create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	results := make([]uploadResult, 0, len(files))
+	results := make([]UploadResult, 0, len(files))
 
 	for _, fh := range files {
 		result := h.processTorrentFile(fh)
 		results = append(results, result)
 	}
-	// If only one file, keep backward-compatible single-object response
-	if len(results) == 1 {
-		if results[0].Error != "" {
-			status := http.StatusInternalServerError
-			if results[0].TooLarge {
-				status = http.StatusRequestEntityTooLarge
-			} else if results[0].Skipped {
-				status = http.StatusConflict
-			}
-			writeError(w, status, results[0].Error)
-			return
-		}
-		writeJSON(w, http.StatusCreated, results[0].Torrent)
-		return
-	}
-
-	writeJSON(w, http.StatusCreated, results)
+	writeJSON(w, uploadResponseStatus(results), UploadResponse{Results: results})
 }
 
-func (h *TorrentHandler) processTorrentFile(fh *multipart.FileHeader) uploadResult {
+func (h *TorrentHandler) processTorrentFile(fh *multipart.FileHeader) UploadResult {
+	result := UploadResult{Filename: fh.Filename, Status: "error", httpStatus: http.StatusBadRequest}
 	if fh.Size > maxTorrentFileSize {
-		return uploadResult{Error: "Torrent file exceeds the 2 MiB limit", TooLarge: true}
+		result.Error = "Torrent file exceeds the 2 MiB limit"
+		result.httpStatus = http.StatusRequestEntityTooLarge
+		return result
 	}
 
 	f, err := fh.Open()
 	if err != nil {
-		return uploadResult{Error: "Failed to open file: " + err.Error()}
+		result.Error = "Failed to open file"
+		result.httpStatus = http.StatusInternalServerError
+		return result
 	}
 	defer f.Close()
 
 	data, err := io.ReadAll(io.LimitReader(f, maxTorrentFileSize+1))
 	if err != nil {
-		return uploadResult{Error: "Failed to read file"}
+		result.Error = "Failed to read file"
+		result.httpStatus = http.StatusInternalServerError
+		return result
 	}
 	if len(data) > maxTorrentFileSize {
-		return uploadResult{Error: "Torrent file exceeds the 2 MiB limit", TooLarge: true}
+		result.Error = "Torrent file exceeds the 2 MiB limit"
+		result.httpStatus = http.StatusRequestEntityTooLarge
+		return result
 	}
 
 	tf, err := protocol.ParseTorrent(bytes.NewReader(data))
 	if err != nil {
-		return uploadResult{Error: "Failed to parse torrent: " + err.Error()}
+		result.Error = "Failed to parse torrent: " + err.Error()
+		return result
 	}
 
 	trackersJSON, _ := json.Marshal(tf.Trackers)
@@ -151,26 +151,57 @@ func (h *TorrentHandler) processTorrentFile(fh *multipart.FileHeader) uploadResu
 
 	if err := h.db.CreateTorrent(torrent); err != nil {
 		if strings.Contains(err.Error(), "UNIQUE") {
-			return uploadResult{Error: "Torrent already exists: " + tf.Name, Skipped: true}
+			result.Status = "skipped"
+			result.Error = "Torrent already exists: " + tf.Name
+			result.httpStatus = http.StatusConflict
+			return result
 		}
 		log.Printf("Failed to save torrent: %v", err)
-		return uploadResult{Error: "Failed to save torrent"}
+		result.Error = "Failed to save torrent"
+		result.httpStatus = http.StatusInternalServerError
+		return result
 	}
+	result.Torrent = torrent
 
 	// Auto-create and start session
 	sessionID, err := h.createAndStartSession(torrent)
+	result.SessionID = sessionID
 	if err != nil {
 		log.Printf("Auto-start failed for %s: %v", torrent.Name, err)
-		return uploadResult{Torrent: torrent, Error: "Torrent saved but session failed: " + err.Error()}
+		result.Status = "saved"
+		result.Error = "Torrent saved but session failed: " + err.Error()
+		result.httpStatus = http.StatusMultiStatus
+		return result
 	}
 
-	return uploadResult{Torrent: torrent, SessionID: sessionID}
+	result.Status = "started"
+	result.SessionID = sessionID
+	result.httpStatus = http.StatusCreated
+	return result
+}
+
+func uploadResponseStatus(results []UploadResult) int {
+	if len(results) == 1 {
+		return results[0].httpStatus
+	}
+	for _, result := range results {
+		if result.Status != "started" {
+			return http.StatusMultiStatus
+		}
+	}
+	return http.StatusCreated
 }
 
 func (h *TorrentHandler) createAndStartSession(torrent *storage.Torrent) (string, error) {
 	settings, err := h.db.GetSettings()
 	if err != nil {
 		return "", fmt.Errorf("get settings: %w", err)
+	}
+	if err := validateSettings(settings); err != nil {
+		return "", fmt.Errorf("invalid settings: %w", err)
+	}
+	if err := validatePort(config.Get().Engine.DefaultAnnouncePort); err != nil {
+		return "", err
 	}
 
 	profileName := settings.ClientProfile
@@ -204,7 +235,7 @@ func (h *TorrentHandler) createAndStartSession(torrent *storage.Torrent) (string
 	}
 
 	if err := h.manager.StartSession(session.ID); err != nil {
-		return "", fmt.Errorf("start session: %w", err)
+		return session.ID, fmt.Errorf("start session: %w", err)
 	}
 
 	return session.ID, nil
@@ -232,6 +263,10 @@ func (h *TorrentHandler) Delete(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := h.db.DeleteTorrent(id); err != nil {
+		if err == sql.ErrNoRows {
+			writeError(w, http.StatusNotFound, "Torrent not found")
+			return
+		}
 		writeError(w, http.StatusInternalServerError, "Failed to delete torrent")
 		return
 	}

@@ -3,6 +3,7 @@ package api
 import (
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -21,17 +22,31 @@ type Server struct {
 }
 
 func NewServer(cfg *config.Config, db *storage.Database, manager *engine.Manager) *Server {
+	if reconciled, err := db.ReconcileRunningSessions(); err != nil {
+		log.Printf("Failed to reconcile interrupted sessions: %v", err)
+	} else if reconciled > 0 {
+		log.Printf("Reconciled %d interrupted running session(s)", reconciled)
+	}
 	s := &Server{
 		mux: http.NewServeMux(),
 	}
 	s.setupRoutes(db, manager)
 	s.httpServer = &http.Server{
-		Addr:              fmt.Sprintf("%s:%d", cfg.Server.Host, cfg.Server.Port),
-		Handler:           securityHeaders(logMiddleware(s.mux)),
+		Addr:              listenAddress(cfg.Server.Host, cfg.Server.Port),
+		Handler:           securityHeaders(logMiddleware(requestOriginPolicy(cfg, s.mux))),
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       120 * time.Second,
 	}
 	return s
+}
+
+func listenAddress(host string, port int) string {
+	if strings.HasPrefix(host, "[") && strings.HasSuffix(host, "]") {
+		if unbracketed := strings.TrimSuffix(strings.TrimPrefix(host, "["), "]"); net.ParseIP(unbracketed) != nil {
+			host = unbracketed
+		}
+	}
+	return net.JoinHostPort(host, fmt.Sprintf("%d", port))
 }
 
 func (s *Server) setupRoutes(db *storage.Database, manager *engine.Manager) {

@@ -217,10 +217,8 @@ func (m *Manager) syncRunnerAllocationsLocked(activeIDs []string) {
 			allocation = speedAllocation{}
 		}
 
-		runner.session.UploadSpeed = allocation.upload
-		runner.session.DownloadSpeed = allocation.download
-		runner.session.SpeedVariance = allocation.variance
-		_ = m.db.UpdateSession(runner.session)
+		snapshot := runner.updateAllocation(allocation.upload, allocation.download, allocation.variance)
+		_ = m.db.UpdateSession(snapshot)
 	}
 }
 
@@ -286,12 +284,13 @@ func (m *Manager) getSpeedAllocation(sessionID string) (int64, int64, int64) {
 func (m *Manager) StartSession(sessionID string) error {
 	m.mu.Lock()
 
-	// Check if already running
-	if runner, ok := m.runners[sessionID]; ok && runner.IsRunning() {
+	// A runner remains registered from creation until its goroutine exits, so
+	// map membership also reserves a concurrency slot while Start is in flight.
+	if _, ok := m.runners[sessionID]; ok {
 		m.mu.Unlock()
-		return fmt.Errorf("session %s is already running", sessionID)
+		return fmt.Errorf("session %s is already running or stopping", sessionID)
 	}
-	if m.maxSessions > 0 && len(m.activeSessionIDs()) >= m.maxSessions {
+	if m.maxSessions > 0 && len(m.runners) >= m.maxSessions {
 		m.mu.Unlock()
 		return fmt.Errorf("maximum concurrent sessions reached (%d)", m.maxSessions)
 	}
@@ -307,6 +306,9 @@ func (m *Manager) StartSession(sessionID string) error {
 		m.mu.Unlock()
 		return fmt.Errorf("get torrent: %w", err)
 	}
+	if category, categoryErr := m.db.GetCategoryForSession(sessionID); categoryErr == nil && category.TargetRatio > 0 {
+		session.TargetRatio = category.TargetRatio
+	}
 
 	// Speed allocator: shared across all active sessions with slight variation,
 	// while preserving the configured global total.
@@ -314,9 +316,10 @@ func (m *Manager) StartSession(sessionID string) error {
 		return m.getSpeedAllocation(sessionID)
 	}
 
-	runner, err := NewSessionRunner(session, torrent,
+	var runner *SessionRunner
+	runner, err = NewSessionRunner(session, torrent,
 		func(s *storage.Session) {
-			m.db.UpdateSession(s)
+			m.persistRunnerUpdate(runner, s)
 		},
 		func(level, msg string) {
 			m.addLog(sessionID, level, msg)
@@ -329,13 +332,62 @@ func (m *Manager) StartSession(sessionID string) error {
 	}
 
 	m.runners[sessionID] = runner
-	m.mu.Unlock()
-
 	if err := runner.Start(); err != nil {
+		delete(m.runners, sessionID)
+		m.mu.Unlock()
 		return err
 	}
+	m.mu.Unlock()
+	go m.removeRunnerWhenDone(sessionID, runner)
 	m.refreshRunnerAllocations()
 	return nil
+}
+
+func (m *Manager) persistRunnerUpdate(runner *SessionRunner, snapshot *storage.Session) {
+	current, err := m.db.GetSession(snapshot.ID)
+	if err == nil && !current.UpdatedAt.Equal(snapshot.UpdatedAt) && sessionConfigurationChanged(current, snapshot) {
+		// Adopt edits made through legacy direct database callers rather than
+		// replacing them with a stale runner snapshot.
+		snapshot = runner.updateConfiguration(current)
+	}
+	_ = m.db.UpdateSession(snapshot)
+}
+
+func sessionConfigurationChanged(a, b *storage.Session) bool {
+	return a.UploadSpeed != b.UploadSpeed ||
+		a.DownloadSpeed != b.DownloadSpeed ||
+		a.SpeedVariance != b.SpeedVariance ||
+		a.TargetRatio != b.TargetRatio ||
+		a.StopAtRatio != b.StopAtRatio ||
+		a.MaxUpload != b.MaxUpload ||
+		a.MaxDownload != b.MaxDownload ||
+		a.NetworkInterface != b.NetworkInterface
+}
+
+func (m *Manager) removeRunnerWhenDone(sessionID string, runner *SessionRunner) {
+	<-runner.Done()
+	m.mu.Lock()
+	if m.runners[sessionID] == runner {
+		delete(m.runners, sessionID)
+		delete(m.allocations, sessionID)
+		m.allocationKey = ""
+	}
+	m.mu.Unlock()
+	m.refreshRunnerAllocations()
+}
+
+// UpdateSession safely applies editable session configuration. Runtime-owned
+// counters and tracker state are preserved when the session is active.
+func (m *Manager) UpdateSession(session *storage.Session) error {
+	m.mu.RLock()
+	runner := m.runners[session.ID]
+	m.mu.RUnlock()
+	if runner == nil {
+		return m.db.UpdateSession(cloneSession(session))
+	}
+
+	snapshot := runner.updateConfiguration(session)
+	return m.db.UpdateSession(snapshot)
 }
 
 func (m *Manager) StopSession(sessionID string) error {
@@ -343,7 +395,7 @@ func (m *Manager) StopSession(sessionID string) error {
 	runner, ok := m.runners[sessionID]
 	m.mu.Unlock()
 
-	if !ok || !runner.IsRunning() {
+	if !ok {
 		// Update status in DB even if runner not found
 		session, err := m.db.GetSession(sessionID)
 		if err == nil {
@@ -368,13 +420,11 @@ func (m *Manager) StopAll() {
 
 	var wg sync.WaitGroup
 	for _, r := range runners {
-		if r.IsRunning() {
-			wg.Add(1)
-			go func(runner *SessionRunner) {
-				defer wg.Done()
-				runner.Stop()
-			}(r)
-		}
+		wg.Add(1)
+		go func(runner *SessionRunner) {
+			defer wg.Done()
+			runner.Stop()
+		}(r)
 	}
 	wg.Wait()
 }

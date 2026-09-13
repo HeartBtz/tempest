@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"math"
 	"sync"
 	"time"
 
@@ -22,6 +23,8 @@ type SessionRunner struct {
 	infoHash       [20]byte
 	trackers       []string
 	stopCh         chan struct{}
+	done           chan struct{}
+	started        bool
 	running        bool
 	completedSent  bool
 	mu             sync.Mutex
@@ -65,7 +68,7 @@ func NewSessionRunner(
 	}
 
 	return &SessionRunner{
-		session:        session,
+		session:        cloneSession(session),
 		torrent:        torrent,
 		profile:        profile,
 		tracker:        tracker,
@@ -73,6 +76,7 @@ func NewSessionRunner(
 		infoHash:       infoHash,
 		trackers:       trackers,
 		stopCh:         make(chan struct{}),
+		done:           make(chan struct{}),
 		onUpdate:       onUpdate,
 		onLog:          onLog,
 		speedAllocator: speedAllocator,
@@ -81,24 +85,23 @@ func NewSessionRunner(
 
 func (sr *SessionRunner) Start() error {
 	sr.mu.Lock()
-	if sr.running {
+	if sr.started {
 		sr.mu.Unlock()
-		return fmt.Errorf("session already running")
+		return fmt.Errorf("session already started")
 	}
+	sr.started = true
 	sr.running = true
 	sr.session.Status = "running"
-	sr.mu.Unlock()
-
-	// Generate peer ID and key if not set
 	if sr.session.PeerID == "" {
 		sr.session.PeerID = sr.profile.GeneratePeerID()
 	}
 	if sr.session.Key == "" {
 		sr.session.Key = sr.profile.GenerateKey()
 	}
+	snapshot := cloneSession(sr.session)
+	sr.mu.Unlock()
 
-	sr.applyAllocatedSpeeds()
-	sr.onUpdate(sr.session)
+	sr.update(snapshot)
 	sr.log("info", "Session started for %s", sr.torrent.Name)
 
 	go sr.runLoop()
@@ -110,31 +113,26 @@ func (sr *SessionRunner) applyAllocatedSpeeds() {
 		return
 	}
 	uploadSpeed, downloadSpeed, variance := sr.speedAllocator()
+	sr.mu.Lock()
 	sr.session.UploadSpeed = uploadSpeed
 	sr.session.DownloadSpeed = downloadSpeed
 	sr.session.SpeedVariance = variance
+	sr.mu.Unlock()
 }
 
 func (sr *SessionRunner) Stop() {
 	sr.mu.Lock()
-	if !sr.running {
+	if !sr.started {
 		sr.mu.Unlock()
 		return
 	}
-	sr.running = false
+	if sr.running {
+		sr.running = false
+		close(sr.stopCh)
+	}
+	done := sr.done
 	sr.mu.Unlock()
-
-	close(sr.stopCh)
-
-	// Send stopped event
-	sr.session.UploadSpeed = 0
-	sr.session.DownloadSpeed = 0
-	sr.session.SpeedVariance = 0
-	sr.announce(protocol.EventStopped)
-
-	sr.session.Status = "stopped"
-	sr.onUpdate(sr.session)
-	sr.log("info", "Session stopped for %s", sr.torrent.Name)
+	<-done
 }
 
 func (sr *SessionRunner) IsRunning() bool {
@@ -143,16 +141,25 @@ func (sr *SessionRunner) IsRunning() bool {
 	return sr.running
 }
 
+func (sr *SessionRunner) Done() <-chan struct{} {
+	return sr.done
+}
+
 func (sr *SessionRunner) runLoop() {
+	defer close(sr.done)
+
 	// Initial announce with "started" event
 	sr.applyAllocatedSpeeds()
 	sr.announce(protocol.EventStarted)
-
-	interval := sr.session.AnnounceInterval
-	if interval <= 0 {
-		interval = 1800
+	if sr.checkStopConditions() {
+		sr.mu.Lock()
+		sr.running = false
+		sr.mu.Unlock()
+		sr.finish("completed", "Session auto-stopped for %s")
+		return
 	}
-	interval = sr.randomizer.RandomizeInterval(interval)
+
+	interval := sr.nextInterval()
 
 	timer := time.NewTimer(time.Duration(interval) * time.Second)
 	defer timer.Stop()
@@ -160,6 +167,7 @@ func (sr *SessionRunner) runLoop() {
 	for {
 		select {
 		case <-sr.stopCh:
+			sr.finish("stopped", "Session stopped for %s")
 			return
 		case <-timer.C:
 			sr.mu.Lock()
@@ -173,11 +181,7 @@ func (sr *SessionRunner) runLoop() {
 			sr.simulateTransfer(interval)
 
 			// Check if download completed (send completed event only once)
-			event := protocol.EventNone
-			if sr.session.Left <= 0 && sr.session.Downloaded > 0 && !sr.completedSent {
-				event = protocol.EventCompleted
-				sr.completedSent = true
-			}
+			event := sr.nextEvent()
 
 			sr.announce(event)
 
@@ -186,22 +190,11 @@ func (sr *SessionRunner) runLoop() {
 				sr.mu.Lock()
 				sr.running = false
 				sr.mu.Unlock()
-				sr.session.UploadSpeed = 0
-				sr.session.DownloadSpeed = 0
-				sr.session.SpeedVariance = 0
-				sr.announce(protocol.EventStopped)
-				sr.session.Status = "completed"
-				sr.onUpdate(sr.session)
-				sr.log("info", "Session auto-stopped for %s", sr.torrent.Name)
+				sr.finish("completed", "Session auto-stopped for %s")
 				return
 			}
 
-			// Use interval from tracker response, or default
-			interval = sr.session.AnnounceInterval
-			if interval <= 0 {
-				interval = 1800
-			}
-			interval = sr.randomizer.RandomizeInterval(interval)
+			interval = sr.nextInterval()
 			timer.Reset(time.Duration(interval) * time.Second)
 		}
 	}
@@ -209,6 +202,8 @@ func (sr *SessionRunner) runLoop() {
 
 func (sr *SessionRunner) simulateTransfer(intervalSec int) {
 	sr.applyAllocatedSpeeds()
+	sr.mu.Lock()
+	defer sr.mu.Unlock()
 	uploadSpeed := sr.session.UploadSpeed
 	downloadSpeed := sr.session.DownloadSpeed
 	variance := sr.session.SpeedVariance
@@ -257,6 +252,9 @@ func (sr *SessionRunner) simulateTransfer(intervalSec int) {
 // checkStopConditions checks if the session should auto-stop based on ratio/limits.
 // Returns true if the session should stop.
 func (sr *SessionRunner) checkStopConditions() bool {
+	sr.mu.Lock()
+	defer sr.mu.Unlock()
+
 	// Check stop-at-ratio
 	if sr.session.StopAtRatio {
 		// For ratio calculation, use Downloaded if available, otherwise use torrent size
@@ -274,11 +272,11 @@ func (sr *SessionRunner) checkStopConditions() bool {
 		}
 	}
 
-	// Check if both upload and download hit their max limits
+	// Each configured transfer limit is an independent stop condition.
 	uploadDone := sr.session.MaxUpload > 0 && sr.session.Uploaded >= sr.session.MaxUpload
 	downloadDone := sr.session.MaxDownload > 0 && sr.session.Downloaded >= sr.session.MaxDownload
-	if sr.session.MaxUpload > 0 && sr.session.MaxDownload > 0 && uploadDone && downloadDone {
-		sr.log("info", "Both upload and download limits reached — stopping")
+	if uploadDone || downloadDone {
+		sr.log("info", "Transfer limit reached - stopping")
 		return true
 	}
 
@@ -291,58 +289,167 @@ func (sr *SessionRunner) announce(event protocol.AnnounceEvent) {
 		return
 	}
 
+	sr.mu.Lock()
+	session := cloneSession(sr.session)
+	sr.mu.Unlock()
+
 	trackerURL := sr.trackers[0]
 	sr.log("info", "Announcing to %s (event=%s, up=%d, down=%d, left=%d)",
-		protocol.RedactTrackerURL(trackerURL), event, sr.session.Uploaded, sr.session.Downloaded, sr.session.Left)
+		protocol.RedactTrackerURL(trackerURL), event, session.Uploaded, session.Downloaded, session.Left)
 
 	req := protocol.AnnounceRequest{
 		TrackerURL: trackerURL,
 		InfoHash:   sr.infoHash,
-		PeerID:     sr.session.PeerID,
-		Port:       sr.session.Port,
-		Uploaded:   sr.session.Uploaded,
-		Downloaded: sr.session.Downloaded,
-		Left:       sr.session.Left,
+		PeerID:     session.PeerID,
+		Port:       session.Port,
+		Uploaded:   session.Uploaded,
+		Downloaded: session.Downloaded,
+		Left:       session.Left,
 		Event:      event,
 		Compact:    sr.profile.SupportsCompact,
 		NumWant:    sr.profile.NumWantDefault,
-		Key:        sr.session.Key,
+		Key:        session.Key,
 		Profile:    sr.profile,
 	}
 
 	resp, err := sr.tracker.Announce(req)
 	if err != nil {
-		sr.session.LastError = protocol.RedactSensitiveText(err.Error())
-		sr.log("error", "Announce failed: %s", sr.session.LastError)
-		sr.onUpdate(sr.session)
+		lastError := protocol.RedactSensitiveText(err.Error())
+		sr.mu.Lock()
+		sr.session.LastError = lastError
+		snapshot := cloneSession(sr.session)
+		sr.mu.Unlock()
+		sr.log("error", "Announce failed: %s", lastError)
+		sr.update(snapshot)
 		return
 	}
 
 	if resp.FailureReason != "" {
-		sr.session.LastError = protocol.RedactSensitiveText(resp.FailureReason)
-		sr.log("error", "Tracker returned failure: %s", sr.session.LastError)
-		sr.onUpdate(sr.session)
+		lastError := protocol.RedactSensitiveText(resp.FailureReason)
+		sr.mu.Lock()
+		sr.session.LastError = lastError
+		snapshot := cloneSession(sr.session)
+		sr.mu.Unlock()
+		sr.log("error", "Tracker returned failure: %s", lastError)
+		sr.update(snapshot)
 		return
 	}
 
 	// Update session from tracker response
 	now := time.Now()
+	sr.mu.Lock()
 	sr.session.LastAnnounce = &now
 	sr.session.Seeders = resp.Complete
 	sr.session.Leechers = resp.Incomplete
 	sr.session.LastError = ""
 
 	if resp.Interval > 0 {
-		sr.session.AnnounceInterval = resp.Interval
+		sr.session.AnnounceInterval = clampInterval(resp.Interval)
 	}
 
-	next := now.Add(time.Duration(sr.session.AnnounceInterval) * time.Second)
+	interval := clampInterval(sr.session.AnnounceInterval)
+	sr.session.AnnounceInterval = interval
+	next := now.Add(time.Duration(interval) * time.Second)
 	sr.session.NextAnnounce = &next
+	snapshot := cloneSession(sr.session)
+	sr.mu.Unlock()
 
 	sr.log("info", "Announce OK: interval=%d, seeders=%d, leechers=%d, peers=%d",
 		resp.Interval, resp.Complete, resp.Incomplete, len(resp.Peers))
 
-	sr.onUpdate(sr.session)
+	sr.update(snapshot)
+}
+
+func (sr *SessionRunner) nextInterval() int {
+	sr.mu.Lock()
+	interval := clampInterval(sr.session.AnnounceInterval)
+	sr.session.AnnounceInterval = interval
+	sr.mu.Unlock()
+	return clampInterval(sr.randomizer.RandomizeInterval(interval))
+}
+
+func (sr *SessionRunner) nextEvent() protocol.AnnounceEvent {
+	sr.mu.Lock()
+	defer sr.mu.Unlock()
+	if sr.session.Left <= 0 && sr.session.Downloaded > 0 && !sr.completedSent {
+		sr.completedSent = true
+		return protocol.EventCompleted
+	}
+	return protocol.EventNone
+}
+
+func (sr *SessionRunner) finish(status, message string) {
+	sr.mu.Lock()
+	sr.session.UploadSpeed = 0
+	sr.session.DownloadSpeed = 0
+	sr.session.SpeedVariance = 0
+	sr.mu.Unlock()
+	sr.announce(protocol.EventStopped)
+
+	sr.mu.Lock()
+	sr.session.Status = status
+	snapshot := cloneSession(sr.session)
+	sr.mu.Unlock()
+	sr.update(snapshot)
+	sr.log("info", message, sr.torrent.Name)
+}
+
+func (sr *SessionRunner) updateAllocation(upload, download, variance int64) *storage.Session {
+	sr.mu.Lock()
+	defer sr.mu.Unlock()
+	sr.session.UploadSpeed = upload
+	sr.session.DownloadSpeed = download
+	sr.session.SpeedVariance = variance
+	return cloneSession(sr.session)
+}
+
+func (sr *SessionRunner) updateConfiguration(session *storage.Session) *storage.Session {
+	sr.mu.Lock()
+	defer sr.mu.Unlock()
+	sr.session.UploadSpeed = session.UploadSpeed
+	sr.session.DownloadSpeed = session.DownloadSpeed
+	sr.session.SpeedVariance = session.SpeedVariance
+	sr.session.TargetRatio = session.TargetRatio
+	sr.session.StopAtRatio = session.StopAtRatio
+	sr.session.MaxUpload = session.MaxUpload
+	sr.session.MaxDownload = session.MaxDownload
+	sr.session.NetworkInterface = session.NetworkInterface
+	return cloneSession(sr.session)
+}
+
+func (sr *SessionRunner) update(session *storage.Session) {
+	if sr.onUpdate != nil {
+		sr.onUpdate(session)
+	}
+}
+
+func cloneSession(session *storage.Session) *storage.Session {
+	clone := *session
+	if session.LastAnnounce != nil {
+		value := *session.LastAnnounce
+		clone.LastAnnounce = &value
+	}
+	if session.NextAnnounce != nil {
+		value := *session.NextAnnounce
+		clone.NextAnnounce = &value
+	}
+	return &clone
+}
+
+func clampInterval(interval int) int {
+	const defaultInterval = 1800
+	const minimumInterval = 60
+	maxInterval := int64(math.MaxInt64 / int64(time.Second))
+	if interval <= 0 {
+		return defaultInterval
+	}
+	if interval < minimumInterval {
+		return minimumInterval
+	}
+	if int64(interval) > maxInterval {
+		return int(maxInterval)
+	}
+	return interval
 }
 
 func (sr *SessionRunner) log(level, format string, args ...interface{}) {

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
+	"time"
 
 	"github.com/HeartBtz/tempest/internal/engine"
 	"github.com/HeartBtz/tempest/internal/storage"
@@ -31,9 +32,12 @@ func (h *StatsHandler) GetGlobal(w http.ResponseWriter, r *http.Request) {
 func (h *StatsHandler) GetLogs(w http.ResponseWriter, r *http.Request) {
 	limit := 100
 	if l := r.URL.Query().Get("limit"); l != "" {
-		if n, err := strconv.Atoi(l); err == nil {
-			limit = n
+		n, err := strconv.Atoi(l)
+		if err != nil || n < 1 || n > 1000 {
+			writeError(w, http.StatusBadRequest, "limit must be an integer between 1 and 1000")
+			return
 		}
+		limit = n
 	}
 
 	logs := h.manager.GetLogs(limit)
@@ -50,16 +54,23 @@ func (h *StatsHandler) StreamLogs(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
-	w.Header().Set("Access-Control-Allow-Origin", "*")
 
 	ch := h.manager.SubscribeLogs()
 	defer h.manager.UnsubscribeLogs(ch)
+
+	_, _ = fmt.Fprint(w, ": connected\n\n")
+	flusher.Flush()
+	heartbeat := time.NewTicker(15 * time.Second)
+	defer heartbeat.Stop()
 
 	ctx := r.Context()
 	for {
 		select {
 		case <-ctx.Done():
 			return
+		case <-heartbeat.C:
+			_, _ = fmt.Fprint(w, ": keepalive\n\n")
+			flusher.Flush()
 		case entry, ok := <-ch:
 			if !ok {
 				return

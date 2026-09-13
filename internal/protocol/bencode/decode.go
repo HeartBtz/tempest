@@ -11,35 +11,71 @@ import (
 var (
 	ErrInvalidBencode = errors.New("invalid bencode data")
 	ErrUnexpectedEOF  = errors.New("unexpected end of bencode data")
+	ErrDepthLimit     = errors.New("bencode nesting depth exceeds limit")
+	ErrNodeLimit      = errors.New("bencode decoded node count exceeds limit")
+)
+
+const (
+	maxDecodeDepth = 100
+	maxDecodeNodes = 100_000
+	maxIntLength   = 32               // max digits for bencode integer
+	maxStringLen   = 64 * 1024 * 1024 // 64MB max string length
 )
 
 func Decode(r io.Reader) (interface{}, error) {
-	br := bufio.NewReader(r)
-	return decodeValue(br)
+	d := decoder{r: bufio.NewReader(r)}
+	value, err := d.decodeValue(1)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := d.r.Peek(1); err != io.EOF {
+		if err != nil {
+			return nil, err
+		}
+		return nil, fmt.Errorf("%w: trailing data", ErrInvalidBencode)
+	}
+	return value, nil
 }
 
-func decodeValue(r *bufio.Reader) (interface{}, error) {
-	b, err := r.Peek(1)
+type decoder struct {
+	r     *bufio.Reader
+	nodes int
+}
+
+func (d *decoder) decodeValue(depth int) (interface{}, error) {
+	if depth > maxDecodeDepth {
+		return nil, fmt.Errorf("%w (maximum %d)", ErrDepthLimit, maxDecodeDepth)
+	}
+	if err := d.consumeNode(); err != nil {
+		return nil, err
+	}
+
+	b, err := d.r.Peek(1)
 	if err != nil {
 		return nil, ErrUnexpectedEOF
 	}
 
 	switch {
 	case b[0] == 'i':
-		return decodeInt(r)
+		return decodeInt(d.r)
 	case b[0] == 'l':
-		return decodeList(r)
+		return d.decodeList(depth)
 	case b[0] == 'd':
-		return decodeDict(r)
+		return d.decodeDict(depth)
 	case b[0] >= '0' && b[0] <= '9':
-		return decodeString(r)
+		return decodeString(d.r)
 	default:
 		return nil, ErrInvalidBencode
 	}
 }
 
-const maxIntLength = 32               // max digits for bencode integer
-const maxStringLen = 64 * 1024 * 1024 // 64MB max string length
+func (d *decoder) consumeNode() error {
+	d.nodes++
+	if d.nodes > maxDecodeNodes {
+		return fmt.Errorf("%w (maximum %d)", ErrNodeLimit, maxDecodeNodes)
+	}
+	return nil
+}
 
 func decodeInt(r *bufio.Reader) (int64, error) {
 	// consume 'i'
@@ -99,24 +135,24 @@ func decodeString(r *bufio.Reader) ([]byte, error) {
 	return buf, nil
 }
 
-func decodeList(r *bufio.Reader) ([]interface{}, error) {
+func (d *decoder) decodeList(depth int) ([]interface{}, error) {
 	// consume 'l'
-	if _, err := r.ReadByte(); err != nil {
+	if _, err := d.r.ReadByte(); err != nil {
 		return nil, err
 	}
 
 	var list []interface{}
 	for {
-		b, err := r.Peek(1)
+		b, err := d.r.Peek(1)
 		if err != nil {
 			return nil, ErrUnexpectedEOF
 		}
 		if b[0] == 'e' {
-			r.ReadByte()
+			_, _ = d.r.ReadByte()
 			break
 		}
 
-		val, err := decodeValue(r)
+		val, err := d.decodeValue(depth + 1)
 		if err != nil {
 			return nil, err
 		}
@@ -126,29 +162,32 @@ func decodeList(r *bufio.Reader) ([]interface{}, error) {
 	return list, nil
 }
 
-func decodeDict(r *bufio.Reader) (map[string]interface{}, error) {
+func (d *decoder) decodeDict(depth int) (map[string]interface{}, error) {
 	// consume 'd'
-	if _, err := r.ReadByte(); err != nil {
+	if _, err := d.r.ReadByte(); err != nil {
 		return nil, err
 	}
 
 	dict := make(map[string]interface{})
 	for {
-		b, err := r.Peek(1)
+		b, err := d.r.Peek(1)
 		if err != nil {
 			return nil, ErrUnexpectedEOF
 		}
 		if b[0] == 'e' {
-			r.ReadByte()
+			_, _ = d.r.ReadByte()
 			break
 		}
 
-		keyBytes, err := decodeString(r)
+		if err := d.consumeNode(); err != nil {
+			return nil, err
+		}
+		keyBytes, err := decodeString(d.r)
 		if err != nil {
 			return nil, err
 		}
 
-		val, err := decodeValue(r)
+		val, err := d.decodeValue(depth + 1)
 		if err != nil {
 			return nil, err
 		}

@@ -177,8 +177,9 @@ export default function App() {
   }, [refresh])
 
   const handleUpload = async (files: File[]) => {
-    await api.uploadTorrents(files)
+    const response = await api.uploadTorrents(files)
     await refresh()
+    return response
   }
 
   const handleStartSession = async (id: string) => {
@@ -208,7 +209,13 @@ export default function App() {
   }
 
   const handleSaveSettings = async (data: Settings) => {
-    try { await api.updateSettings(data); setSettings(data) } catch (e: any) { setError(e.message) }
+    try {
+      const savedSettings = await api.updateSettings(data)
+      setSettings(savedSettings)
+    } catch (e: any) {
+      setError(e.message)
+      throw e
+    }
   }
 
   // Category handlers

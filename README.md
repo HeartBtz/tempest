@@ -83,7 +83,7 @@ Then open **http://127.0.0.1:8377**.
 
 ### 1) Install as a system service (recommended)
 
-The install script builds Tempest, creates a system user, and registers a systemd (Linux) or launchd (macOS) service.
+The install script builds Tempest, creates an unprivileged system user, and registers a hardened systemd service on Linux. Managed launchd installation is not supported; use standalone mode as an unprivileged macOS user.
 
 ```bash
 sudo ./install.sh
@@ -109,7 +109,11 @@ After confirmation it builds, copies files, and starts the service.
 | Logs | `/var/log/tempest-prod/` |
 | Env file | `/etc/tempest-prod/tempest.env` |
 
-Re-running the installer is safe: it preserves an existing config file and refreshes the binary and frontend.
+Re-running the installer preserves existing config and environment files and stages the complete deployment before swapping it into place. Health checks resolve the effective listen endpoint after config, service environment, and `.env` overrides; wildcard listeners are probed through the corresponding loopback address. If installation fails, the installer restores the previous files and systemd enabled/disabled and active/inactive states, then verifies health when the restored service was active.
+
+Before changing deployment state, the installer rejects an existing unit whose `User` or `Group` differs from the requested service identity. It also validates existing managed paths, ownership, service access, and non-writable metadata rather than recursively changing their ownership or modes. Installed code, binary, and frontend files remain root-owned and non-writable by the service account; only dedicated data and log directories are writable by it.
+
+For diagnostics, the non-serving command `tempest --config /path/to/config.json --env-file /path/to/tempest.env --health-url` prints the local `/health` URL after applying the same config and environment precedence. `--env-file` is accepted only with `--health-url`.
 
 #### Running multiple instances
 
@@ -250,6 +254,8 @@ Environment variables override `config.json` values:
 | `TEMPEST_ANNOUNCE_PORT` | `6881` | Default announce port |
 | `TEMPEST_ENABLE_RANDOMIZATION` | `true` | Enable speed randomization |
 | `TEMPEST_ALLOW_PRIVATE_TRACKERS` | `false` | Explicitly allow private/loopback/link-local tracker destinations for an isolated authorised lab |
+| `TEMPEST_ALLOWED_HOSTS` | empty | Comma-separated hostnames or IP addresses accepted in HTTP `Host` headers in addition to localhost; do not include schemes, ports, or wildcards |
+| `TEMPEST_ALLOWED_ORIGINS` | empty | Comma-separated exact browser origins (`http://` or `https://`, including any non-default port) allowed for protected reverse-proxy or LAN access |
 
 > `.env` is gitignored. The committed `.env.example` documents all supported variables.
 
@@ -257,6 +263,28 @@ By default, tracker requests reject loopback, private, link-local, unspecified,
 and multicast destinations, and redirects are checked again. Only set
 `TEMPEST_ALLOW_PRIVATE_TRACKERS=true` when an isolated lab must intentionally
 reach an authorised private tracker. See [SECURITY.md](SECURITY.md).
+
+Tempest accepts localhost hosts and same-origin browser requests by default.
+Leave both allowlists empty for localhost-only use. For an authenticated private
+reverse proxy, keep `TEMPEST_HOST=127.0.0.1` and explicitly list the proxy's
+public hostname and browser origin, for example:
+
+```dotenv
+TEMPEST_ALLOWED_HOSTS=tempest.example.lan
+TEMPEST_ALLOWED_ORIGINS=https://tempest.example.lan
+```
+
+For direct access on a trusted LAN, bind deliberately and list every hostname or
+address and origin clients use. Do not use wildcard values:
+
+```dotenv
+TEMPEST_HOST=0.0.0.0
+TEMPEST_ALLOWED_HOSTS=tempest.lan,192.168.1.50
+TEMPEST_ALLOWED_ORIGINS=http://tempest.lan:8377,http://192.168.1.50:8377
+```
+
+These settings only define accepted request boundaries; they do not add
+authentication or make Internet exposure safe.
 
 ### Install-time environment variables
 
@@ -333,7 +361,7 @@ make all            # Build frontend + backend
 make backend        # Build Go backend only
 make frontend       # Build React frontend only
 make run            # Build and run
-make test           # Run tests
+make test           # Run Go/frontend tests, frontend build, and installer checks (Node.js 24)
 make clean          # Remove build artifacts
 make docker         # Build Docker image
 ```

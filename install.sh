@@ -3,7 +3,7 @@
 # Tempest ⚡ — Install Script
 #
 # This script builds and installs Tempest as a system service.
-# Supports: systemd (Linux), launchd (macOS), or standalone mode.
+# Supports: systemd (Linux) or standalone mode.
 #
 # Usage:
 #   sudo ./install.sh              # Install with auto-detection
@@ -27,6 +27,20 @@ LOG_DIR="${TEMPEST_LOG_DIR:-/var/log/${APP_NAME}}"
 CONFIG_DIR="${TEMPEST_CONFIG_DIR:-/etc/${APP_NAME}}"
 PORT="${TEMPEST_PORT:-8377}"
 HOST="${TEMPEST_HOST:-127.0.0.1}"
+
+WAS_ACTIVE=false
+WAS_ENABLE_STATE="not-found"
+STAGED_INSTALL_DIR=""
+BACKUP_INSTALL_DIR=""
+TRANSACTION_DIR=""
+ENV_FILE=""
+UNIT_FILE=""
+UNIT_NEW=""
+CONFIG_PENDING=false
+INSTALL_PHASE=0
+INSTALL_TRANSACTION_ACTIVE=false
+INSTALL_TRANSACTION_VERIFIED=false
+INSTALL_ROLLBACK_RUNNING=false
 
 # --- Colors ---
 RED='\033[0;31m'
@@ -70,13 +84,40 @@ validate_port() {
 }
 
 validate_host() {
-	# Accept any non-empty string (hostname, IP, 0.0.0.0 …)
-	[[ -n "$1" ]]
+	[[ "$1" =~ ^[a-zA-Z0-9_.:-]+$ ]]
 }
 
 validate_name() {
 	# Only allow alphanumeric + dash/underscore
 	[[ "$1" =~ ^[a-zA-Z0-9_-]+$ ]]
+}
+
+validate_path() {
+	[[ "$1" =~ ^/[a-zA-Z0-9_./-]+$ ]] &&
+		[[ "$1" != "/" && "$1" != */ && "$1" != *"//"* ]] &&
+		[[ "/$1/" != *"/../"* && "/$1/" != *"/./"* ]]
+}
+
+validate_config() {
+	validate_name "$APP_NAME" || fatal "Invalid instance name: use letters, numbers, dashes, or underscores."
+	validate_name "$APP_USER" || fatal "Invalid service user: use letters, numbers, dashes, or underscores."
+	validate_port "$PORT" || fatal "Invalid HTTP port."
+	validate_host "$HOST" || fatal "Invalid bind address."
+
+	local path
+	for path in "$INSTALL_DIR" "$DATA_DIR" "$LOG_DIR" "$CONFIG_DIR"; do
+		validate_path "$path" || fatal "Install paths must be absolute and contain no whitespace or '..' segments."
+	done
+
+	case "${DATA_DIR}/" in
+	"${INSTALL_DIR}/"*) fatal "Data directory must not be inside the installation directory." ;;
+	esac
+	case "${LOG_DIR}/" in
+	"${INSTALL_DIR}/"*) fatal "Log directory must not be inside the installation directory." ;;
+	esac
+	case "${INSTALL_DIR}/" in
+	"${DATA_DIR}/"* | "${LOG_DIR}/"*) fatal "Installation directory must not be inside a writable data or log directory." ;;
+	esac
 }
 
 # --- Interactive configuration prompt ---
@@ -136,25 +177,140 @@ prompt_interactive_config() {
 	echo ""
 }
 
-# Copy build artifacts to target dir (skip if same directory)
+# Copy build artifacts to a target directory.
 install_files() {
 	local target="$1"
-	local src_real target_real
-	src_real="$(cd "$SCRIPT_DIR" && pwd -P)"
-	target_real="$(mkdir -p "$target" && cd "$target" && pwd -P)"
-
-	# Always copy the binary from build/ to the target root
-	cp build/tempest "$target/tempest"
-	chmod 755 "$target/tempest"
-
-	if [[ "$src_real" == "$target_real" ]]; then
-		ok "Source and install dir are the same, skipping web copy"
-		return
-	fi
-
+	install -m 0755 build/tempest "$target/tempest"
 	mkdir -p "$target/web"
 	rm -rf "$target/web/dist"
-	cp -r web/dist "$target/web/"
+	cp -a web/dist "$target/web/"
+}
+
+stage_installation() {
+	local parent
+	parent="$(dirname "$INSTALL_DIR")"
+	mkdir -p "$parent"
+	STAGED_INSTALL_DIR="$(mktemp -d "${parent}/.${APP_NAME}.stage.XXXXXX")"
+
+	if [[ -d "$INSTALL_DIR" ]]; then
+		cp -a "$INSTALL_DIR/." "$STAGED_INSTALL_DIR/"
+	fi
+	install_files "$STAGED_INSTALL_DIR"
+	chown -R root:root "$STAGED_INSTALL_DIR"
+	chmod -R go-w "$STAGED_INSTALL_DIR"
+	chmod 755 "$STAGED_INSTALL_DIR"
+}
+
+activate_staged_installation() {
+	BACKUP_INSTALL_DIR=""
+	if [[ -e "$INSTALL_DIR" ]]; then
+		BACKUP_INSTALL_DIR="$(mktemp -d "${INSTALL_DIR}.backup.XXXXXX")"
+		rmdir "$BACKUP_INSTALL_DIR"
+		mv -T -- "$INSTALL_DIR" "$BACKUP_INSTALL_DIR"
+	fi
+	mv -T -- "$STAGED_INSTALL_DIR" "$INSTALL_DIR"
+	STAGED_INSTALL_DIR=""
+}
+
+rollback_installation() {
+	local failed_install_dir=""
+	if [[ -e "$INSTALL_DIR" ]]; then
+		failed_install_dir="$(mktemp -d "${INSTALL_DIR}.failed.XXXXXX")"
+		rmdir "$failed_install_dir"
+		mv -T -- "$INSTALL_DIR" "$failed_install_dir" || return 1
+	fi
+	if [[ -n "$BACKUP_INSTALL_DIR" && -e "$BACKUP_INSTALL_DIR" ]]; then
+		if ! mv -T -- "$BACKUP_INSTALL_DIR" "$INSTALL_DIR"; then
+			[[ -z "$failed_install_dir" ]] || mv -T -- "$failed_install_dir" "$INSTALL_DIR"
+			return 1
+		fi
+	fi
+	[[ -z "$failed_install_dir" ]] || rm -rf -- "$failed_install_dir"
+}
+
+discard_install_backup() {
+	if [[ -n "$BACKUP_INSTALL_DIR" ]]; then
+		rm -rf -- "$BACKUP_INSTALL_DIR"
+	fi
+}
+
+cleanup_install_transaction() {
+	[[ -z "$STAGED_INSTALL_DIR" ]] || rm -rf -- "$STAGED_INSTALL_DIR"
+	[[ -z "$UNIT_NEW" ]] || rm -f -- "$UNIT_NEW"
+	[[ -z "$TRANSACTION_DIR" ]] || rm -rf -- "$TRANSACTION_DIR"
+}
+
+restore_transaction_file() {
+	local previous="$1" destination="$2"
+	if [[ -f "$previous" ]]; then
+		mv -f "$previous" "$destination"
+	else
+		rm -f -- "$destination"
+	fi
+}
+
+rollback_systemd_transaction() {
+	local rollback_ok=true
+	[[ "$INSTALL_ROLLBACK_RUNNING" == false ]] || return 1
+	INSTALL_ROLLBACK_RUNNING=true
+	set +e
+
+	error "Installation did not complete; restoring the previous systemd installation."
+	if ((INSTALL_PHASE >= 50)); then
+		systemctl stop "${APP_NAME}" || rollback_ok=false
+	fi
+	if ((INSTALL_PHASE >= 10)); then
+		rollback_installation || rollback_ok=false
+	fi
+	if ((INSTALL_PHASE >= 20)) && [[ "$CONFIG_PENDING" == true ]]; then
+		rm -f -- "$CONFIG_DIR/config.json" || rollback_ok=false
+	fi
+	if ((INSTALL_PHASE >= 30)); then
+		restore_transaction_file "$TRANSACTION_DIR/tempest.env.previous" "$ENV_FILE" || rollback_ok=false
+	fi
+	if ((INSTALL_PHASE >= 40)); then
+		restore_transaction_file "$TRANSACTION_DIR/service.previous" "$UNIT_FILE" || rollback_ok=false
+	fi
+	if ((INSTALL_PHASE >= 10)); then
+		systemctl daemon-reload || rollback_ok=false
+		restore_systemd_state || rollback_ok=false
+	fi
+	cleanup_install_transaction
+	INSTALL_TRANSACTION_ACTIVE=false
+
+	if [[ "$rollback_ok" == true ]]; then
+		error "The previous deployment and service state were restored."
+		return 0
+	fi
+	error "Rollback could not fully restore or verify the previous service state."
+	return 1
+}
+
+handle_install_error() {
+	local status="$1"
+	error "Installer command failed with status ${status}."
+	exit "$status"
+}
+
+handle_install_signal() {
+	local signal="$1" status="$2"
+	error "Installer interrupted by ${signal}."
+	exit "$status"
+}
+
+handle_install_exit() {
+	local status="$1"
+	trap - ERR INT TERM EXIT
+	if [[ "$INSTALL_TRANSACTION_ACTIVE" == true ]]; then
+		if [[ "$INSTALL_TRANSACTION_VERIFIED" == true ]]; then
+			discard_install_backup
+			cleanup_install_transaction
+		else
+			[[ "$status" -ne 0 ]] || status=1
+			rollback_systemd_transaction || status=1
+		fi
+	fi
+	exit "$status"
 }
 
 check_root() {
@@ -210,6 +366,10 @@ check_prerequisites() {
 		missing+=("gcc (for CGO/SQLite)")
 	fi
 
+	if ! command_exists curl; then
+		missing+=("curl (for service health checks)")
+	fi
+
 	if [[ ${#missing[@]} -gt 0 ]]; then
 		error "Missing required tools:"
 		for tool in "${missing[@]}"; do
@@ -219,15 +379,15 @@ check_prerequisites() {
 		echo "Install them and run this script again."
 		echo ""
 		echo "On Debian/Ubuntu (Bookworm 12+):"
-		echo "  sudo apt install -y golang nodejs npm gcc libc6-dev"
+		echo "  sudo apt install -y golang nodejs npm gcc libc6-dev curl"
 		echo "  # Note: golang-go may be too old on older releases."
 		echo "  # See https://go.dev/doc/install for the latest Go."
 		echo ""
 		echo "On RHEL/Fedora:"
-		echo "  sudo dnf install -y golang nodejs npm gcc"
+		echo "  sudo dnf install -y golang nodejs npm gcc curl"
 		echo ""
 		echo "On macOS:"
-		echo "  brew install go node gcc"
+		echo "  brew install go node gcc curl"
 		exit 1
 	fi
 
@@ -246,6 +406,83 @@ build_app() {
 	ok "Backend built ($(du -sh build/tempest | cut -f1))"
 }
 
+# Validate existing deployment metadata without changing it. Existing writable
+# trees are never recursively chowned or chmodded by this installer.
+validate_existing_path() {
+	local path="$1" type="$2" owner="$3" required_mode="$4" forbidden_mode="$5"
+	local actual_owner mode permissions
+	[[ ! -L "$path" ]] || fatal "Refusing symbolic link at managed path: $path"
+	if [[ "$type" == directory ]]; then
+		[[ -d "$path" ]] || fatal "Managed path is not a directory: $path"
+	else
+		[[ -f "$path" ]] || fatal "Managed path is not a regular file: $path"
+	fi
+	actual_owner="$(stat -c '%U:%G' "$path")"
+	[[ "$actual_owner" == "$owner" ]] || fatal "$path is owned by $actual_owner; expected $owner. Fix ownership before reinstalling."
+	mode="$(stat -c '%a' "$path")"
+	permissions=$((8#$mode))
+	(((permissions & required_mode) == required_mode && (permissions & forbidden_mode) == 0)) ||
+		fatal "$path mode $mode does not provide the required access without unsafe write permissions."
+}
+
+validate_service_access() {
+	local path="$1" access
+	shift
+	for access in "$@"; do
+		runuser -u "$APP_USER" -- test "-$access" "$path" ||
+			fatal "Service user $APP_USER lacks required $access access to $path. No files were changed."
+	done
+}
+
+preflight_systemd_install() {
+	local unit_name="${APP_NAME}.service"
+	local unit_file="/etc/systemd/system/${unit_name}"
+	local existing_user existing_group load_state
+
+	if id "$APP_USER" &>/dev/null && [[ "$(id -u "$APP_USER")" -eq 0 ]]; then
+		fatal "The Tempest service user must be unprivileged."
+	fi
+
+	if ! load_state="$(systemctl show "$unit_name" --property=LoadState --value 2>/dev/null)"; then
+		fatal "Unable to inspect existing systemd unit state. No files were changed."
+	fi
+	if [[ "$load_state" != "not-found" && -n "$load_state" ]]; then
+		existing_user="$(systemctl show "$unit_name" --property=User --value)"
+		existing_group="$(systemctl show "$unit_name" --property=Group --value)"
+		[[ "$existing_user" == "$APP_USER" && "$existing_group" == "$APP_USER" ]] ||
+			fatal "Existing ${unit_name} runs as ${existing_user:-root}:${existing_group:-default}; requested identity is ${APP_USER}:${APP_USER}. No files were changed."
+		systemctl is-active --quiet "$unit_name" && WAS_ACTIVE=true
+		WAS_ENABLE_STATE="$(systemctl is-enabled "$unit_name" 2>/dev/null || true)"
+		case "$WAS_ENABLE_STATE" in
+		enabled | enabled-runtime | disabled) ;;
+		*) fatal "Existing ${unit_name} has unsupported enablement state '${WAS_ENABLE_STATE:-unknown}'. No files were changed." ;;
+		esac
+	fi
+
+	[[ ! -e "$DATA_DIR" ]] || validate_existing_path "$DATA_DIR" directory "$APP_USER:$APP_USER" 0700 0022
+	[[ ! -e "$LOG_DIR" ]] || validate_existing_path "$LOG_DIR" directory "$APP_USER:$APP_USER" 0700 0022
+	[[ ! -e "$CONFIG_DIR" ]] || validate_existing_path "$CONFIG_DIR" directory "root:$APP_USER" 0750 0022
+	[[ ! -e "$CONFIG_DIR/config.json" ]] || validate_existing_path "$CONFIG_DIR/config.json" file "root:$APP_USER" 0440 0133
+	[[ ! -e "$CONFIG_DIR/tempest.env" ]] || validate_existing_path "$CONFIG_DIR/tempest.env" file "root:$APP_USER" 0440 0133
+	[[ ! -e "$unit_file" ]] || validate_existing_path "$unit_file" file "root:root" 0444 0133
+
+	if id "$APP_USER" &>/dev/null; then
+		command_exists runuser || fatal "runuser is required to validate existing service-path access."
+		[[ ! -e "$DATA_DIR" ]] || validate_service_access "$DATA_DIR" r w x
+		[[ ! -e "$LOG_DIR" ]] || validate_service_access "$LOG_DIR" r w x
+		[[ ! -e "$CONFIG_DIR" ]] || validate_service_access "$CONFIG_DIR" x
+		[[ ! -e "$CONFIG_DIR/config.json" ]] || validate_service_access "$CONFIG_DIR/config.json" r
+		[[ ! -e "$CONFIG_DIR/tempest.env" ]] || validate_service_access "$CONFIG_DIR/tempest.env" r
+	fi
+}
+
+resolve_health_url() {
+	local helper="$1" working_dir="$2" config_file="$3" env_file="$4"
+	local args=(--config "$config_file" --health-url)
+	[[ ! -f "$env_file" ]] || args+=(--env-file "$env_file")
+	(cd "$working_dir" && env -i "$helper" "${args[@]}")
+}
+
 # --- Install (systemd) ---
 install_systemd() {
 	info "Installing with systemd..."
@@ -256,15 +493,32 @@ install_systemd() {
 		ok "Created system user: $APP_USER"
 	fi
 
-	# Create directories
-	mkdir -p "$INSTALL_DIR" "$DATA_DIR" "$LOG_DIR" "$CONFIG_DIR"
+	# New writable directories use fixed identities and modes. Existing paths
+	# were validated during preflight and are deliberately left untouched.
+	[[ -d "$DATA_DIR" ]] || install -d -o "$APP_USER" -g "$APP_USER" -m 0750 "$DATA_DIR"
+	[[ -d "$LOG_DIR" ]] || install -d -o "$APP_USER" -g "$APP_USER" -m 0750 "$LOG_DIR"
+	[[ -d "$CONFIG_DIR" ]] || install -d -o root -g "$APP_USER" -m 0750 "$CONFIG_DIR"
 
-	# Copy binary and frontend
-	install_files "$INSTALL_DIR"
+	local env_new config_new
+	TRANSACTION_DIR="$(mktemp -d "${CONFIG_DIR}/.install-transaction.XXXXXX")"
+	chmod 700 "$TRANSACTION_DIR"
+	ENV_FILE="${CONFIG_DIR}/tempest.env"
+	env_new="${TRANSACTION_DIR}/tempest.env.new"
+	config_new="${TRANSACTION_DIR}/config.json.new"
+	UNIT_FILE="/etc/systemd/system/${APP_NAME}.service"
+	INSTALL_TRANSACTION_ACTIVE=true
+	trap 'handle_install_error $?' ERR
+	trap 'handle_install_signal INT 130' INT
+	trap 'handle_install_signal TERM 143' TERM
+	trap 'handle_install_exit $?' EXIT
+	UNIT_NEW="$(mktemp "/etc/systemd/system/.${APP_NAME}.service.new.XXXXXX")"
+	[[ -f "$ENV_FILE" ]] && cp -a "$ENV_FILE" "$TRANSACTION_DIR/tempest.env.previous"
+	[[ -f "$UNIT_FILE" ]] && cp -a "$UNIT_FILE" "$TRANSACTION_DIR/service.previous"
 
-	# Create config if not exists
+	# Stage a default config only for a new instance.
 	if [[ ! -f "$CONFIG_DIR/config.json" ]]; then
-		cat >"$CONFIG_DIR/config.json" <<CONF
+		CONFIG_PENDING=true
+		cat >"$config_new" <<CONF
 {
   "server": {
     "host": "${HOST}",
@@ -280,13 +534,17 @@ install_systemd() {
   }
 }
 CONF
-		ok "Config created: $CONFIG_DIR/config.json"
+		chown root:"$APP_USER" "$config_new"
+		chmod 640 "$config_new"
 	else
 		warn "Config already exists, skipping: $CONFIG_DIR/config.json"
 	fi
 
-	# Create / refresh environment file (used by the systemd unit)
-	cat >"$CONFIG_DIR/tempest.env" <<ENV
+	# Preserve operator-managed runtime overrides on upgrades.
+	if [[ -f "$ENV_FILE" ]]; then
+		cp -a "$ENV_FILE" "$env_new"
+	else
+		cat >"$env_new" <<ENV
 # Tempest — Environment configuration
 # Generated by install.sh; edit this file to change paths or settings
 # without touching the .service file directly.
@@ -298,17 +556,14 @@ TEMPEST_CONFIG_DIR=${CONFIG_DIR}
 TEMPEST_CONFIG=${CONFIG_DIR}/config.json
 TEMPEST_USER=${APP_USER}
 ENV
-	ok "Environment file created: $CONFIG_DIR/tempest.env"
+	fi
+	chown root:"$APP_USER" "$env_new"
+	chmod 640 "$env_new"
 
-	# Set ownership
-	chown -R "$APP_USER:$APP_USER" "$INSTALL_DIR" "$DATA_DIR" "$LOG_DIR"
-	chown -R root:"$APP_USER" "$CONFIG_DIR"
-	chmod 640 "$CONFIG_DIR/config.json" "$CONFIG_DIR/tempest.env"
-
-	# Create systemd unit
+	# Stage the systemd unit.
 	# Note: \$TEMPEST_CONFIG is expanded at runtime by systemd from the EnvironmentFile,
 	# not by this script. All other ${VAR} references are expanded by bash during install.
-	cat >/etc/systemd/system/${APP_NAME}.service <<UNIT
+	cat >"$UNIT_NEW" <<UNIT
 [Unit]
 Description=Tempest ⚡ BitTorrent Announce Testing Dashboard (${APP_NAME})
 After=network.target
@@ -322,6 +577,7 @@ WorkingDirectory=${INSTALL_DIR}
 ExecStart=${INSTALL_DIR}/tempest --config \$TEMPEST_CONFIG
 Restart=on-failure
 RestartSec=5
+TimeoutStopSec=10
 StandardOutput=append:${LOG_DIR}/tempest.log
 StandardError=append:${LOG_DIR}/tempest-error.log
 
@@ -330,7 +586,7 @@ NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes
-ReadWritePaths=${DATA_DIR} ${LOG_DIR} ${INSTALL_DIR}
+ReadWritePaths=${DATA_DIR} ${LOG_DIR}
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 
@@ -341,15 +597,35 @@ LimitNPROC=4096
 [Install]
 WantedBy=multi-user.target
 UNIT
+	chmod 644 "$UNIT_NEW"
 
-	# Enable and start (restart if already running)
+	stage_installation
+	INSTALL_PHASE=10
+	activate_staged_installation
+	if [[ "$CONFIG_PENDING" == true ]]; then
+		INSTALL_PHASE=20
+		mv "$config_new" "$CONFIG_DIR/config.json"
+	fi
+	INSTALL_PHASE=30
+	mv "$env_new" "$ENV_FILE"
+	chown root:"$APP_USER" "$ENV_FILE"
+	INSTALL_PHASE=40
+	mv "$UNIT_NEW" "$UNIT_FILE"
+	UNIT_NEW=""
+	chown root:root "$UNIT_FILE"
+
+	INSTALL_PHASE=50
 	systemctl daemon-reload
 	systemctl enable "${APP_NAME}"
-	if systemctl is-active --quiet "${APP_NAME}"; then
-		systemctl restart "${APP_NAME}"
-	else
-		systemctl start "${APP_NAME}"
-	fi
+	systemctl restart "${APP_NAME}"
+	wait_for_systemd_health "${SCRIPT_DIR}/build/tempest"
+
+	INSTALL_TRANSACTION_VERIFIED=true
+	discard_install_backup
+	BACKUP_INSTALL_DIR=""
+	cleanup_install_transaction
+	INSTALL_TRANSACTION_ACTIVE=false
+	trap - ERR INT TERM EXIT
 
 	ok "Systemd service installed and started"
 	echo ""
@@ -361,69 +637,46 @@ UNIT
 	echo "  tail -f $LOG_DIR/${APP_NAME}.log # Application logs"
 }
 
-# --- Install (launchd / macOS) ---
-install_launchd() {
-	info "Installing with launchd (macOS)..."
-
-	mkdir -p "$INSTALL_DIR" "$DATA_DIR" "$LOG_DIR" "$CONFIG_DIR"
-
-	install_files "$INSTALL_DIR"
-
-	if [[ ! -f "$CONFIG_DIR/config.json" ]]; then
-		cat >"$CONFIG_DIR/config.json" <<CONF
-{
-  "server": {
-    "host": "${HOST}",
-    "port": ${PORT}
-  },
-  "database": {
-    "path": "${DATA_DIR}/tempest.db"
-  },
-  "engine": {
-    "max_concurrent_sessions": 500,
-    "default_announce_port": 6881,
-    "enable_randomization": true
-  }
+wait_for_systemd_health() {
+	local helper="$1" health_url attempt
+	health_url="$(resolve_health_url "$helper" "$INSTALL_DIR" "$CONFIG_DIR/config.json" "$CONFIG_DIR/tempest.env")" || return 1
+	for ((attempt = 1; attempt <= 30; attempt++)); do
+		if systemctl is-active --quiet "${APP_NAME}" && curl --fail --silent --max-time 2 "$health_url" >/dev/null; then
+			return 0
+		fi
+		sleep 1
+	done
+	return 1
 }
-CONF
+
+restore_systemd_state() {
+	case "$WAS_ENABLE_STATE" in
+	enabled)
+		systemctl enable "${APP_NAME}" || return 1
+		;;
+	enabled-runtime)
+		systemctl disable "${APP_NAME}" >/dev/null 2>&1 || true
+		systemctl enable --runtime "${APP_NAME}" || return 1
+		;;
+	disabled | not-found)
+		if systemctl is-enabled --quiet "${APP_NAME}"; then
+			systemctl disable "${APP_NAME}" || return 1
+		fi
+		! systemctl is-enabled --quiet "${APP_NAME}" || return 1
+		;;
+	*) return 1 ;;
+	esac
+	if [[ "$WAS_ACTIVE" == true ]]; then
+		systemctl restart "${APP_NAME}" && wait_for_systemd_health "${SCRIPT_DIR}/build/tempest"
+	else
+		if systemctl is-active --quiet "${APP_NAME}"; then
+			systemctl stop "${APP_NAME}" || return 1
+		fi
+		if systemctl is-active --quiet "${APP_NAME}"; then
+			return 1
+		fi
+		return 0
 	fi
-
-	local plist="/Library/LaunchDaemons/fr.hbtz.tempest.plist"
-	cat >"$plist" <<PLIST
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>fr.hbtz.tempest</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>${INSTALL_DIR}/tempest</string>
-        <string>--config</string>
-        <string>${CONFIG_DIR}/config.json</string>
-    </array>
-    <key>WorkingDirectory</key>
-    <string>${INSTALL_DIR}</string>
-    <key>RunAtLoad</key>
-    <true/>
-    <key>KeepAlive</key>
-    <true/>
-    <key>StandardOutPath</key>
-    <string>${LOG_DIR}/tempest.log</string>
-    <key>StandardErrorPath</key>
-    <string>${LOG_DIR}/tempest-error.log</string>
-</dict>
-</plist>
-PLIST
-
-	launchctl unload "$plist" 2>/dev/null || true
-	launchctl load "$plist"
-	ok "launchd service installed and started"
-	echo ""
-	info "Useful commands:"
-	echo "  sudo launchctl list | grep tempest  # Check status"
-	echo "  sudo launchctl stop fr.hbtz.tempest   # Stop"
-	echo "  sudo launchctl start fr.hbtz.tempest  # Start"
 }
 
 # --- Standalone mode (no root, no service manager) ---
@@ -526,13 +779,11 @@ uninstall() {
 			systemctl stop "${APP_NAME}"
 		fi
 		systemctl disable "${APP_NAME}" 2>/dev/null || true
-		rm -f /etc/systemd/system/${APP_NAME}.service
+		rm -f "/etc/systemd/system/${APP_NAME}.service"
 		systemctl daemon-reload
 		ok "Systemd service removed"
 	elif [[ "$init_system" == "launchd" ]]; then
-		launchctl unload /Library/LaunchDaemons/fr.hbtz.tempest.plist 2>/dev/null || true
-		rm -f /Library/LaunchDaemons/fr.hbtz.tempest.plist
-		ok "launchd service removed"
+		fatal "Managed launchd installations are not supported; no service was removed."
 	fi
 
 	if id "$APP_USER" &>/dev/null; then
@@ -557,10 +808,12 @@ main() {
 
 	case "${1:-}" in
 	--uninstall | -u)
+		validate_config
 		uninstall
 		exit 0
 		;;
 	--standalone | -s)
+		validate_config
 		check_prerequisites
 		build_app
 		install_standalone
@@ -594,19 +847,26 @@ main() {
 	esac
 
 	prompt_interactive_config
+	validate_config
 	check_root
-	check_prerequisites
-	build_app
 
 	local init_system
 	init_system=$(detect_init_system)
+	if [[ "$init_system" == "systemd" ]]; then
+		preflight_systemd_install
+	elif [[ "$init_system" == "launchd" ]]; then
+		fatal "Managed macOS installation is not supported. Use --standalone as an unprivileged user."
+	fi
+
+	check_prerequisites
+	build_app
 
 	case "$init_system" in
 	systemd)
 		install_systemd
 		;;
 	launchd)
-		install_launchd
+		fatal "Managed macOS installation is not supported. Use --standalone as an unprivileged user."
 		;;
 	none)
 		warn "No supported init system detected."

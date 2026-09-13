@@ -1,4 +1,4 @@
-import type { Torrent, Session, GlobalStats, LogEntry, ClientProfile, NetworkInterface, Settings, Category } from '../types';
+import type { Torrent, Session, GlobalStats, LogEntry, ClientProfile, NetworkInterface, Settings, Category, UploadResponse } from '../types';
 
 const BASE = '/api';
 
@@ -19,17 +19,38 @@ export const listTorrents = () => request<Torrent[]>('/torrents');
 
 export const getTorrent = (id: string) => request<Torrent>(`/torrents/${id}`);
 
-export const uploadTorrents = async (files: File[]): Promise<unknown> => {
+export function isUploadResponse(payload: unknown): payload is UploadResponse {
+  if (typeof payload !== 'object' || payload === null) return false;
+  const results = (payload as { results?: unknown }).results;
+  return Array.isArray(results) && results.every(result => {
+    if (typeof result !== 'object' || result === null) return false;
+    const candidate = result as { filename?: unknown; status?: unknown; error?: unknown };
+    return typeof candidate.filename === 'string' &&
+      ['started', 'saved', 'skipped', 'error'].includes(String(candidate.status)) &&
+      (candidate.error === undefined || typeof candidate.error === 'string');
+  });
+}
+
+function uploadError(payload: unknown, fallback: string): string {
+  if (typeof payload === 'object' && payload !== null &&
+      typeof (payload as { error?: unknown }).error === 'string') {
+    return (payload as { error: string }).error;
+  }
+  return fallback;
+}
+
+export const uploadTorrents = async (files: File[]): Promise<UploadResponse> => {
   const form = new FormData();
   for (const file of files) {
     form.append('torrent', file);
   }
   const res = await fetch(`${BASE}/torrents`, { method: 'POST', body: form });
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({ error: res.statusText }));
-    throw new Error(err.error || res.statusText);
+  const payload: unknown = await res.json().catch(() => null);
+  if (isUploadResponse(payload)) {
+    return payload;
   }
-  return res.json();
+  if (!res.ok) throw new Error(uploadError(payload, res.statusText));
+  throw new Error('Upload returned an invalid response');
 };
 
 export const deleteTorrent = (id: string) =>

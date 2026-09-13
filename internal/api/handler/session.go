@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"database/sql"
 	"encoding/json"
 	"log"
 	"net/http"
@@ -93,6 +94,10 @@ func (h *SessionHandler) Create(w http.ResponseWriter, r *http.Request) {
 	}
 
 	port := config.Get().Engine.DefaultAnnouncePort
+	if err := validatePort(port); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 
 	session := &storage.Session{
 		ID:               generateID(),
@@ -193,6 +198,42 @@ func (h *SessionHandler) Update(w http.ResponseWriter, r *http.Request, id strin
 		writeError(w, http.StatusBadRequest, "Invalid request body")
 		return
 	}
+	if req.UploadSpeed != nil {
+		if err := validateSpeed("upload_speed", *req.UploadSpeed); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+	}
+	if req.DownloadSpeed != nil {
+		if err := validateSpeed("download_speed", *req.DownloadSpeed); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+	}
+	if req.SpeedVariance != nil {
+		if err := validateSpeed("speed_variance", *req.SpeedVariance); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+	}
+	if req.TargetRatio != nil {
+		if err := validateTargetRatio(*req.TargetRatio); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+	}
+	if req.MaxUpload != nil {
+		if err := validateTransferLimit("max_upload", *req.MaxUpload); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+	}
+	if req.MaxDownload != nil {
+		if err := validateTransferLimit("max_download", *req.MaxDownload); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+	}
 
 	session, err := h.db.GetSession(id)
 	if err != nil {
@@ -225,12 +266,20 @@ func (h *SessionHandler) Update(w http.ResponseWriter, r *http.Request, id strin
 		session.NetworkInterface = *req.NetworkInterface
 	}
 
-	if err := h.db.UpdateSession(session); err != nil {
+	if err := h.manager.UpdateSession(session); err != nil {
+		if err == sql.ErrNoRows {
+			writeError(w, http.StatusNotFound, "Session not found")
+			return
+		}
 		writeError(w, http.StatusInternalServerError, "Failed to update session")
 		return
 	}
-
-	writeJSON(w, http.StatusOK, session)
+	updated, err := h.db.GetSession(id)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "Failed to read updated session")
+		return
+	}
+	writeJSON(w, http.StatusOK, updated)
 }
 
 func (h *SessionHandler) Delete(w http.ResponseWriter, r *http.Request, id string) {
@@ -238,6 +287,10 @@ func (h *SessionHandler) Delete(w http.ResponseWriter, r *http.Request, id strin
 	h.manager.StopSession(id)
 
 	if err := h.db.DeleteSession(id); err != nil {
+		if err == sql.ErrNoRows {
+			writeError(w, http.StatusNotFound, "Session not found")
+			return
+		}
 		writeError(w, http.StatusInternalServerError, "Failed to delete session")
 		return
 	}
@@ -245,6 +298,10 @@ func (h *SessionHandler) Delete(w http.ResponseWriter, r *http.Request, id strin
 }
 
 func (h *SessionHandler) Start(w http.ResponseWriter, r *http.Request, id string) {
+	if _, err := h.db.GetSession(id); err != nil {
+		writeError(w, http.StatusNotFound, "Session not found")
+		return
+	}
 	if err := h.manager.StartSession(id); err != nil {
 		writeError(w, http.StatusInternalServerError, "Failed to start session: "+err.Error())
 		return
@@ -253,6 +310,10 @@ func (h *SessionHandler) Start(w http.ResponseWriter, r *http.Request, id string
 }
 
 func (h *SessionHandler) Stop(w http.ResponseWriter, r *http.Request, id string) {
+	if _, err := h.db.GetSession(id); err != nil {
+		writeError(w, http.StatusNotFound, "Session not found")
+		return
+	}
 	if err := h.manager.StopSession(id); err != nil {
 		writeError(w, http.StatusInternalServerError, "Failed to stop session: "+err.Error())
 		return

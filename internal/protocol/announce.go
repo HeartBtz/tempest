@@ -18,11 +18,48 @@ import (
 	"github.com/HeartBtz/tempest/internal/protocol/bencode"
 )
 
-const maxTrackerResponseSize = 2 << 20
+const (
+	maxTrackerResponseSize          = 2 << 20
+	trackerRequestTimeout           = 30 * time.Second
+	maxTrackerIntervalSeconds int64 = (1<<63 - 1) / int64(time.Second)
+)
 
 var (
-	trackerURLPattern = regexp.MustCompile(`https?://[^\s]+`)
-	passkeyPattern    = regexp.MustCompile(`(?i)(passkey|auth|token|key)=([^&\s]+)`)
+	trackerURLPattern  = regexp.MustCompile(`https?://[^\s]+`)
+	passkeyPattern     = regexp.MustCompile(`(?i)(passkey|auth|token|key)=([^&\s]+)`)
+	specialUsePrefixes = []netip.Prefix{
+		netip.MustParsePrefix("0.0.0.0/8"),
+		netip.MustParsePrefix("10.0.0.0/8"),
+		netip.MustParsePrefix("100.64.0.0/10"),
+		netip.MustParsePrefix("127.0.0.0/8"),
+		netip.MustParsePrefix("169.254.0.0/16"),
+		netip.MustParsePrefix("172.16.0.0/12"),
+		netip.MustParsePrefix("192.0.0.0/24"),
+		netip.MustParsePrefix("192.0.2.0/24"),
+		netip.MustParsePrefix("192.31.196.0/24"),
+		netip.MustParsePrefix("192.52.193.0/24"),
+		netip.MustParsePrefix("192.88.99.0/24"),
+		netip.MustParsePrefix("192.168.0.0/16"),
+		netip.MustParsePrefix("192.175.48.0/24"),
+		netip.MustParsePrefix("198.18.0.0/15"),
+		netip.MustParsePrefix("198.51.100.0/24"),
+		netip.MustParsePrefix("203.0.113.0/24"),
+		netip.MustParsePrefix("224.0.0.0/4"),
+		netip.MustParsePrefix("240.0.0.0/4"),
+		netip.MustParsePrefix("64:ff9b::/96"),
+		netip.MustParsePrefix("64:ff9b:1::/48"),
+		netip.MustParsePrefix("100::/64"),
+		netip.MustParsePrefix("2001::/23"),
+		netip.MustParsePrefix("2001:db8::/32"),
+		netip.MustParsePrefix("2002::/16"),
+		netip.MustParsePrefix("2620:4f:8000::/48"),
+		netip.MustParsePrefix("3fff::/20"),
+		netip.MustParsePrefix("5f00::/16"),
+		netip.MustParsePrefix("fc00::/7"),
+		netip.MustParsePrefix("fe80::/10"),
+		netip.MustParsePrefix("fec0::/10"),
+		netip.MustParsePrefix("ff00::/8"),
+	}
 )
 
 type AnnounceEvent string
@@ -68,6 +105,7 @@ type Peer struct {
 type TrackerClient struct {
 	httpClient   *http.Client
 	allowPrivate bool
+	setupErr     error
 }
 
 func NewTrackerClient() *TrackerClient {
@@ -79,36 +117,19 @@ func NewTrackerClientWithInterface(ifaceName string) *TrackerClient {
 }
 
 func newTrackerClient(ifaceName string) *TrackerClient {
-	dialer := &net.Dialer{Timeout: 30 * time.Second}
+	baseDialer := net.Dialer{Timeout: trackerRequestTimeout}
+	var localIPs []netip.Addr
+	var setupErr error
 	if ifaceName != "" {
-		// Find the interface and get its first IP
-		iface, err := net.InterfaceByName(ifaceName)
-		if err == nil {
-			addrs, err := iface.Addrs()
-			if err == nil && len(addrs) > 0 {
-				// Parse the first IPv4 address
-				for _, addr := range addrs {
-					var ip net.IP
-					switch v := addr.(type) {
-					case *net.IPNet:
-						ip = v.IP
-					case *net.IPAddr:
-						ip = v.IP
-					}
-					if ip != nil && ip.To4() != nil {
-						localAddr := &net.TCPAddr{IP: ip}
-						dialer.LocalAddr = localAddr
-						break
-					}
-				}
-			}
-		}
-
+		localIPs, setupErr = interfaceAddresses(ifaceName)
 	}
 
 	allowPrivate := config.Get().Security.AllowPrivateTrackerDestinations
 	transport := &http.Transport{
 		DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
+			if setupErr != nil {
+				return nil, setupErr
+			}
 			host, port, err := net.SplitHostPort(address)
 			if err != nil {
 				return nil, fmt.Errorf("invalid tracker address")
@@ -125,13 +146,24 @@ func newTrackerClient(ifaceName string) *TrackerClient {
 			if len(ips) == 0 {
 				return nil, fmt.Errorf("tracker host resolved to no addresses")
 			}
-			return dialer.DialContext(ctx, network, net.JoinHostPort(ips[0].String(), port))
+
+			remoteIP := ips[0]
+			dialer := baseDialer
+			if ifaceName != "" {
+				localIP, selectedRemote, ok := compatibleDialAddresses(localIPs, ips)
+				if !ok {
+					return nil, fmt.Errorf("tracker interface %q has no usable address compatible with tracker destination", ifaceName)
+				}
+				remoteIP = selectedRemote
+				dialer.LocalAddr = &net.TCPAddr{IP: net.IP(localIP.AsSlice()), Zone: localIP.Zone()}
+			}
+			return dialer.DialContext(ctx, network, net.JoinHostPort(remoteIP.String(), port))
 		},
 	}
 
-	tc := &TrackerClient{allowPrivate: allowPrivate}
+	tc := &TrackerClient{allowPrivate: allowPrivate, setupErr: setupErr}
 	tc.httpClient = &http.Client{
-		Timeout:   30 * time.Second,
+		Timeout:   trackerRequestTimeout,
 		Transport: transport,
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			if len(via) >= 3 {
@@ -144,14 +176,23 @@ func newTrackerClient(ifaceName string) *TrackerClient {
 }
 
 func (tc *TrackerClient) Announce(req AnnounceRequest) (*AnnounceResponse, error) {
+	if tc.setupErr != nil {
+		return nil, tc.setupErr
+	}
 	trackerURL, err := url.Parse(req.TrackerURL)
 	if err != nil || (trackerURL.Scheme != "http" && trackerURL.Scheme != "https") {
 		return nil, fmt.Errorf("unsupported tracker protocol")
 	}
-	if err := validateTrackerDestination(context.Background(), trackerURL, tc.allowPrivate); err != nil {
+	validationCtx, cancel := initialTrackerValidationContext()
+	defer cancel()
+	if err := validateTrackerDestination(validationCtx, trackerURL, tc.allowPrivate); err != nil {
 		return nil, err
 	}
 	return tc.announceHTTP(req)
+}
+
+func initialTrackerValidationContext() (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.Background(), trackerRequestTimeout)
 }
 
 func (tc *TrackerClient) announceHTTP(req AnnounceRequest) (*AnnounceResponse, error) {
@@ -198,13 +239,75 @@ func validateTrackerDestination(ctx context.Context, trackerURL *url.URL, allowP
 			return fmt.Errorf("tracker destination is blocked by SSRF policy")
 		}
 	}
+	if len(ips) == 0 {
+		return fmt.Errorf("tracker host resolved to no addresses")
+	}
 	return nil
 }
 
 func isRestrictedDestination(ip netip.Addr) bool {
 	ip = ip.Unmap()
-	return !ip.IsValid() || ip.IsUnspecified() || ip.IsLoopback() || ip.IsPrivate() ||
-		ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsMulticast()
+	if !ip.IsValid() || !ip.IsGlobalUnicast() {
+		return true
+	}
+	// IsGlobalUnicast includes many IANA special-purpose ranges that are not
+	// safe public tracker destinations, so reject the full registries explicitly.
+	for _, prefix := range specialUsePrefixes {
+		if prefix.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+func interfaceAddresses(ifaceName string) ([]netip.Addr, error) {
+	iface, err := net.InterfaceByName(ifaceName)
+	if err != nil {
+		return nil, fmt.Errorf("tracker interface %q is unavailable: %w", ifaceName, err)
+	}
+	if iface.Flags&net.FlagUp == 0 {
+		return nil, fmt.Errorf("tracker interface %q is not up", ifaceName)
+	}
+	addrs, err := iface.Addrs()
+	if err != nil {
+		return nil, fmt.Errorf("list addresses for tracker interface %q: %w", ifaceName, err)
+	}
+
+	localIPs := make([]netip.Addr, 0, len(addrs))
+	for _, addr := range addrs {
+		var ip net.IP
+		switch value := addr.(type) {
+		case *net.IPNet:
+			ip = value.IP
+		case *net.IPAddr:
+			ip = value.IP
+		}
+		parsed, ok := netip.AddrFromSlice(ip)
+		if !ok || parsed.IsUnspecified() || parsed.IsMulticast() {
+			continue
+		}
+		parsed = parsed.Unmap()
+		if parsed.Is6() && parsed.IsLinkLocalUnicast() {
+			parsed = parsed.WithZone(iface.Name)
+		}
+		localIPs = append(localIPs, parsed)
+	}
+	if len(localIPs) == 0 {
+		return nil, fmt.Errorf("tracker interface %q has no usable IP address", ifaceName)
+	}
+	return localIPs, nil
+}
+
+func compatibleDialAddresses(localIPs, remoteIPs []netip.Addr) (netip.Addr, netip.Addr, bool) {
+	for _, remoteIP := range remoteIPs {
+		remoteIP = remoteIP.Unmap()
+		for _, localIP := range localIPs {
+			if localIP.Is4() == remoteIP.Is4() {
+				return localIP, remoteIP, true
+			}
+		}
+	}
+	return netip.Addr{}, netip.Addr{}, false
 }
 
 func RedactTrackerURL(raw string) string {
@@ -316,13 +419,13 @@ func (tc *TrackerClient) parseResponse(data []byte) (*AnnounceResponse, error) {
 
 	if interval, ok := dict["interval"]; ok {
 		if i, ok := interval.(int64); ok {
-			resp.Interval = int(i)
+			resp.Interval = safeTrackerInterval(i)
 		}
 	}
 
 	if minInterval, ok := dict["min interval"]; ok {
 		if i, ok := minInterval.(int64); ok {
-			resp.MinInterval = int(i)
+			resp.MinInterval = safeTrackerInterval(i)
 		}
 	}
 
@@ -363,6 +466,20 @@ func (tc *TrackerClient) parseResponse(data []byte) (*AnnounceResponse, error) {
 	}
 
 	return resp, nil
+}
+
+func safeTrackerInterval(seconds int64) int {
+	if seconds <= 0 {
+		return 0
+	}
+	maxSeconds := maxTrackerIntervalSeconds
+	if maxInt := int64(^uint(0) >> 1); maxSeconds > maxInt {
+		maxSeconds = maxInt
+	}
+	if seconds > maxSeconds {
+		seconds = maxSeconds
+	}
+	return int(seconds)
 }
 
 func parseCompactPeers(data []byte) []Peer {

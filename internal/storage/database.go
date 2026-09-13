@@ -3,8 +3,10 @@ package storage
 import (
 	"database/sql"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"time"
 
@@ -135,6 +137,9 @@ func (d *Database) addColumnIfNotExists(table, column, definition string) error 
 			return nil // already exists
 		}
 	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
 	_, err = d.db.Exec(fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s", table, column, definition))
 	return err
 }
@@ -145,12 +150,12 @@ func (d *Database) CreateTorrent(t *Torrent) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
-	_, err := d.db.Exec(
+	result, err := d.db.Exec(
 		`INSERT INTO torrents (id, name, info_hash, size, trackers, comment, file_path, category_id, created_at)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		t.ID, t.Name, t.InfoHash, t.Size, t.Trackers, t.Comment, t.FilePath, t.CategoryID, t.CreatedAt,
 	)
-	return err
+	return requireAffected(result, err)
 }
 
 func (d *Database) GetTorrent(id string) (*Torrent, error) {
@@ -196,16 +201,16 @@ func (d *Database) DeleteTorrent(id string) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
-	_, err := d.db.Exec(`DELETE FROM torrents WHERE id = ?`, id)
-	return err
+	result, err := d.db.Exec(`DELETE FROM torrents WHERE id = ?`, id)
+	return requireAffected(result, err)
 }
 
 func (d *Database) SetTorrentCategory(torrentID string, categoryID *string) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
-	_, err := d.db.Exec(`UPDATE torrents SET category_id = ? WHERE id = ?`, categoryID, torrentID)
-	return err
+	result, err := d.db.Exec(`UPDATE torrents SET category_id = ? WHERE id = ?`, categoryID, torrentID)
+	return requireAffected(result, err)
 }
 
 func (d *Database) AssignTorrentsToCategory(torrentIDs []string, categoryID *string) error {
@@ -223,7 +228,8 @@ func (d *Database) AssignTorrentsToCategory(torrentIDs []string, categoryID *str
 	}
 	defer stmt.Close()
 	for _, id := range torrentIDs {
-		if _, err := stmt.Exec(categoryID, id); err != nil {
+		result, err := stmt.Exec(categoryID, id)
+		if err := requireAffected(result, err); err != nil {
 			tx.Rollback()
 			return err
 		}
@@ -237,7 +243,7 @@ func (d *Database) CreateSession(s *Session) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
-	_, err := d.db.Exec(
+	result, err := d.db.Exec(
 		`INSERT INTO sessions (id, torrent_id, status, client_profile, peer_id, port, key,
 		 uploaded, downloaded, left_bytes, upload_speed, download_speed, speed_variance,
 		 target_ratio, stop_at_ratio, max_upload, max_download, network_interface,
@@ -248,7 +254,7 @@ func (d *Database) CreateSession(s *Session) error {
 		s.TargetRatio, s.StopAtRatio, s.MaxUpload, s.MaxDownload, s.NetworkInterface,
 		s.AnnounceInterval, s.Seeders, s.Leechers, s.LastError, s.CreatedAt, s.UpdatedAt,
 	)
-	return err
+	return requireAffected(result, err)
 }
 
 func (d *Database) GetSession(id string) (*Session, error) {
@@ -345,7 +351,7 @@ func (d *Database) UpdateSession(s *Session) error {
 	defer d.mu.Unlock()
 
 	s.UpdatedAt = time.Now()
-	_, err := d.db.Exec(
+	result, err := d.db.Exec(
 		`UPDATE sessions SET status = ?, uploaded = ?, downloaded = ?, left_bytes = ?,
 		 upload_speed = ?, download_speed = ?, speed_variance = ?,
 		 target_ratio = ?, stop_at_ratio = ?, max_upload = ?, max_download = ?,
@@ -359,15 +365,31 @@ func (d *Database) UpdateSession(s *Session) error {
 		s.Seeders, s.Leechers, s.LastAnnounce, s.NextAnnounce, s.LastError,
 		s.UpdatedAt, s.ID,
 	)
-	return err
+	return requireAffected(result, err)
 }
 
 func (d *Database) DeleteSession(id string) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
-	_, err := d.db.Exec(`DELETE FROM sessions WHERE id = ?`, id)
-	return err
+	result, err := d.db.Exec(`DELETE FROM sessions WHERE id = ?`, id)
+	return requireAffected(result, err)
+}
+
+// ReconcileRunningSessions clears statuses that can only be backed by an
+// in-memory runner. They are stale after an unclean process exit.
+func (d *Database) ReconcileRunningSessions() (int64, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	result, err := d.db.Exec(
+		`UPDATE sessions SET status = 'stopped', upload_speed = 0, download_speed = 0,
+		 speed_variance = 0, updated_at = ? WHERE status = 'running'`, time.Now(),
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
 }
 
 func (d *Database) GetGlobalStats() (*GlobalStats, error) {
@@ -376,10 +398,20 @@ func (d *Database) GetGlobalStats() (*GlobalStats, error) {
 
 	stats := &GlobalStats{}
 
-	d.db.QueryRow(`SELECT COUNT(*) FROM torrents`).Scan(&stats.TotalTorrents)
-	d.db.QueryRow(`SELECT COUNT(*) FROM sessions WHERE status = 'running'`).Scan(&stats.ActiveSessions)
-	d.db.QueryRow(`SELECT COALESCE(SUM(uploaded), 0) FROM sessions`).Scan(&stats.TotalUploaded)
-	d.db.QueryRow(`SELECT COALESCE(SUM(downloaded), 0) FROM sessions`).Scan(&stats.TotalDownloaded)
+	queries := []struct {
+		query string
+		dest  any
+	}{
+		{`SELECT COUNT(*) FROM torrents`, &stats.TotalTorrents},
+		{`SELECT COUNT(*) FROM sessions WHERE status = 'running'`, &stats.ActiveSessions},
+		{`SELECT COALESCE(SUM(uploaded), 0) FROM sessions`, &stats.TotalUploaded},
+		{`SELECT COALESCE(SUM(downloaded), 0) FROM sessions`, &stats.TotalDownloaded},
+	}
+	for _, query := range queries {
+		if err := d.db.QueryRow(query.query).Scan(query.dest); err != nil {
+			return nil, err
+		}
+	}
 
 	return stats, nil
 }
@@ -424,12 +456,12 @@ func (d *Database) CreateCategory(c *Category) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
-	_, err := d.db.Exec(
+	result, err := d.db.Exec(
 		`INSERT INTO categories (id, name, color, upload_speed, download_speed, speed_variance, target_ratio, created_at)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
 		c.ID, c.Name, c.Color, c.UploadSpeed, c.DownloadSpeed, c.SpeedVariance, c.TargetRatio, c.CreatedAt,
 	)
-	return err
+	return requireAffected(result, err)
 }
 
 func (d *Database) GetCategory(id string) (*Category, error) {
@@ -479,12 +511,12 @@ func (d *Database) UpdateCategory(c *Category) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
-	_, err := d.db.Exec(
+	result, err := d.db.Exec(
 		`UPDATE categories SET name = ?, color = ?, upload_speed = ?, download_speed = ?, speed_variance = ?, target_ratio = ?
 		 WHERE id = ?`,
 		c.Name, c.Color, c.UploadSpeed, c.DownloadSpeed, c.SpeedVariance, c.TargetRatio, c.ID,
 	)
-	return err
+	return requireAffected(result, err)
 }
 
 func (d *Database) DeleteCategory(id string) error {
@@ -492,8 +524,8 @@ func (d *Database) DeleteCategory(id string) error {
 	defer d.mu.Unlock()
 
 	// Torrents in this category will have category_id set to NULL (ON DELETE SET NULL)
-	_, err := d.db.Exec(`DELETE FROM categories WHERE id = ?`, id)
-	return err
+	result, err := d.db.Exec(`DELETE FROM categories WHERE id = ?`, id)
+	return requireAffected(result, err)
 }
 
 // GetCategoryForTorrent returns the category for a given torrent (nil if uncategorized).
@@ -542,35 +574,56 @@ func (d *Database) GetSettings() (*Settings, error) {
 
 	rows, err := d.db.Query(`SELECT key, value FROM settings`)
 	if err != nil {
-		return s, nil
+		return nil, err
 	}
 	defer rows.Close()
 
 	for rows.Next() {
 		var k, v string
 		if err := rows.Scan(&k, &v); err != nil {
-			continue
+			return nil, err
 		}
 		switch k {
 		case "client_profile":
 			s.ClientProfile = v
 		case "upload_speed":
-			fmt.Sscanf(v, "%d", &s.UploadSpeed)
+			if s.UploadSpeed, err = strconv.ParseInt(v, 10, 64); err != nil {
+				return nil, fmt.Errorf("parse setting %s: %w", k, err)
+			}
 		case "download_speed":
-			fmt.Sscanf(v, "%d", &s.DownloadSpeed)
+			if s.DownloadSpeed, err = strconv.ParseInt(v, 10, 64); err != nil {
+				return nil, fmt.Errorf("parse setting %s: %w", k, err)
+			}
 		case "speed_variance":
-			fmt.Sscanf(v, "%d", &s.SpeedVariance)
+			if s.SpeedVariance, err = strconv.ParseInt(v, 10, 64); err != nil {
+				return nil, fmt.Errorf("parse setting %s: %w", k, err)
+			}
 		case "target_ratio":
-			fmt.Sscanf(v, "%f", &s.TargetRatio)
+			if s.TargetRatio, err = strconv.ParseFloat(v, 64); err != nil {
+				return nil, fmt.Errorf("parse setting %s: %w", k, err)
+			}
+			if math.IsNaN(s.TargetRatio) || math.IsInf(s.TargetRatio, 0) {
+				return nil, fmt.Errorf("parse setting %s: value must be finite", k)
+			}
 		case "stop_at_ratio":
+			if v != "0" && v != "1" {
+				return nil, fmt.Errorf("parse setting %s: invalid boolean %q", k, v)
+			}
 			s.StopAtRatio = v == "1"
 		case "max_upload":
-			fmt.Sscanf(v, "%d", &s.MaxUpload)
+			if s.MaxUpload, err = strconv.ParseInt(v, 10, 64); err != nil {
+				return nil, fmt.Errorf("parse setting %s: %w", k, err)
+			}
 		case "max_download":
-			fmt.Sscanf(v, "%d", &s.MaxDownload)
+			if s.MaxDownload, err = strconv.ParseInt(v, 10, 64); err != nil {
+				return nil, fmt.Errorf("parse setting %s: %w", k, err)
+			}
 		case "network_interface":
 			s.NetworkInterface = v
 		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
 	}
 
 	return s, nil
@@ -585,25 +638,47 @@ func (d *Database) SaveSettings(s *Settings) error {
 		stopAtRatio = "1"
 	}
 
-	pairs := map[string]string{
-		"client_profile":    s.ClientProfile,
-		"upload_speed":      fmt.Sprintf("%d", s.UploadSpeed),
-		"download_speed":    fmt.Sprintf("%d", s.DownloadSpeed),
-		"speed_variance":    fmt.Sprintf("%d", s.SpeedVariance),
-		"target_ratio":      fmt.Sprintf("%f", s.TargetRatio),
-		"stop_at_ratio":     stopAtRatio,
-		"max_upload":        fmt.Sprintf("%d", s.MaxUpload),
-		"max_download":      fmt.Sprintf("%d", s.MaxDownload),
-		"network_interface": s.NetworkInterface,
+	pairs := []struct {
+		key   string
+		value string
+	}{
+		{"client_profile", s.ClientProfile},
+		{"upload_speed", strconv.FormatInt(s.UploadSpeed, 10)},
+		{"download_speed", strconv.FormatInt(s.DownloadSpeed, 10)},
+		{"speed_variance", strconv.FormatInt(s.SpeedVariance, 10)},
+		{"target_ratio", strconv.FormatFloat(s.TargetRatio, 'g', -1, 64)},
+		{"stop_at_ratio", stopAtRatio},
+		{"max_upload", strconv.FormatInt(s.MaxUpload, 10)},
+		{"max_download", strconv.FormatInt(s.MaxDownload, 10)},
+		{"network_interface", s.NetworkInterface},
 	}
 
-	for k, v := range pairs {
-		if _, err := d.db.Exec(
-			`INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)`, k, v,
+	tx, err := d.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for _, pair := range pairs {
+		if _, err := tx.Exec(
+			`INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)`, pair.key, pair.value,
 		); err != nil {
 			return err
 		}
 	}
 
+	return tx.Commit()
+}
+
+func requireAffected(result sql.Result, err error) error {
+	if err != nil {
+		return err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected == 0 {
+		return sql.ErrNoRows
+	}
 	return nil
 }
