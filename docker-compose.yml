@@ -1,0 +1,28 @@
+services:
+  tempest:
+    build: .
+    ports:
+      - "${TEMPEST_BIND_ADDRESS:-127.0.0.1}:${TEMPEST_PORT:-8377}:8377"
+    volumes:
+      - tempest-data:/app/data
+    environment:
+      - TEMPEST_HOST=0.0.0.0
+      - TEMPEST_PORT=8377
+      - TEMPEST_DB_PATH=/app/data/tempest.db
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp:noexec,nosuid,nodev,size=32m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8377/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  tempest-data:

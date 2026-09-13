@@ -1,0 +1,65 @@
+# Binaries
+build/
+*.exe
+/tempest
+
+# Database
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Config (user-specific)
+config.json
+
+# Frontend
+web/node_modules/
+web/dist/
+web/.vite/
+web/.cache/
+npm-debug.log*
+
+# OS
+.DS_Store
+Thumbs.db
+Desktop.ini
+._*
+
+# IDE / Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+*.bak
+\#*\#
+.#*
+
+# Logs
+*.log
+logs/
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Temporary
+tmp/
+temp/
+*.tmp
+
+# Coverage / Testing
+coverage/
+*.out
+*.test
+
+# Archives
+*.tar.gz
+*.zip
+
+# Install artifacts
+*.pid
+
+# Local data directories
+data/
