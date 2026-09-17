@@ -55,6 +55,7 @@ coverage/
 *.test
 
 # Archives
+/dist/
 *.tar.gz
 *.zip
 

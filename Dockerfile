@@ -8,13 +8,14 @@ RUN npm run build
 
 # Build backend
 FROM golang:1.24-alpine AS backend
+ARG VERSION=0.1.0
 RUN apk add --no-cache gcc musl-dev
 WORKDIR /app
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
 COPY --from=frontend /app/web/dist ./web/dist
-RUN CGO_ENABLED=1 go build -ldflags "-s -w" -o tempest ./cmd/tempest
+RUN CGO_ENABLED=1 go build -ldflags "-s -w -X github.com/HeartBtz/tempest/internal/buildinfo.Version=${VERSION}" -o tempest ./cmd/tempest
 
 # Runtime
 FROM alpine:3.23
