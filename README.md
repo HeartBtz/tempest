@@ -307,6 +307,12 @@ These are used by `install.sh` to configure paths and the systemd service:
 
 Tempest exposes a JSON API under `/api`.
 
+`GET /health` returns `{"status":"ok","version":"MAJOR.MINOR.PATCH"}`. Release
+builds inject the exact protected-tag SemVer, allowing deployment tooling to
+verify what is actually serving rather than infer deployment from a pipeline.
+See [the release contract](docs/RELEASE.md); production deployment is currently
+blocked because no dedicated forced receiver is documented.
+
 ### Torrents
 
 | Method | Endpoint | Description |

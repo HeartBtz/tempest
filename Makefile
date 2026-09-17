@@ -8,7 +8,7 @@ all: frontend backend
 
 backend:
 	@echo "⚡ Building Tempest backend..."
-	CGO_ENABLED=1 go build -ldflags "-s -w -X main.version=$(VERSION)" -o $(BUILD_DIR)/$(BINARY) ./cmd/tempest
+	CGO_ENABLED=1 go build -ldflags "-s -w -X github.com/HeartBtz/tempest/internal/buildinfo.Version=$(VERSION)" -o $(BUILD_DIR)/$(BINARY) ./cmd/tempest
 
 frontend:
 	@echo "⚡ Building Tempest frontend..."

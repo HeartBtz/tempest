@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/HeartBtz/tempest/internal/api/handler"
+	"github.com/HeartBtz/tempest/internal/buildinfo"
 	"github.com/HeartBtz/tempest/internal/config"
 	"github.com/HeartBtz/tempest/internal/engine"
 	"github.com/HeartBtz/tempest/internal/storage"
@@ -56,7 +57,8 @@ func (s *Server) setupRoutes(db *storage.Database, manager *engine.Manager) {
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"status":"healthy"}`))
+		w.Header().Set("Cache-Control", "no-store")
+		_, _ = fmt.Fprintf(w, `{"status":"ok","version":%q}`, buildinfo.Version)
 	})
 
 	th := handler.NewTorrentHandler(db, manager)

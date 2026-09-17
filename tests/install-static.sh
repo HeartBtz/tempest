@@ -3,6 +3,8 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 installer="${repo_root}/install.sh"
+ci_config="${repo_root}/.gitlab-ci.yml"
+release_builder="${repo_root}/scripts/build-release.sh"
 # These patterns intentionally match unexpanded shell variables in install.sh.
 # shellcheck disable=SC2016
 readonly expected_read_write_paths='ReadWritePaths=${DATA_DIR} ${LOG_DIR}'
@@ -29,8 +31,20 @@ fail() {
 }
 
 bash -n "$installer"
+bash -n "$release_builder"
 if command -v shellcheck >/dev/null 2>&1; then
-	shellcheck "$installer" "$0"
+	shellcheck "$installer" "$release_builder" "$0"
+fi
+
+grep -Fq 'CI_PIPELINE_SOURCE == "merge_request_event"' "$ci_config" || fail "merge request pipelines are not enabled"
+grep -Fq 'CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+$/' "$ci_config" || fail "exact SemVer tag rules are missing"
+# These patterns intentionally match unexpanded GitLab variables.
+# shellcheck disable=SC2016
+grep -Fq 'test "$CI_COMMIT_REF_PROTECTED" = "true"' "$ci_config" || fail "release tags are not required to be protected"
+# shellcheck disable=SC2016
+grep -Fq 'scripts/build-release.sh "$CI_COMMIT_TAG"' "$ci_config" || fail "release artifact build is missing"
+if grep -Eq '^deploy-production:' "$ci_config"; then
+	fail "production deployment exists without a documented forced receiver"
 fi
 
 grep -Fq "$expected_read_write_paths" "$installer" || fail "writable paths are not restricted to data and logs"

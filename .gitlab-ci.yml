@@ -1,0 +1,50 @@
+stages:
+  - validate
+  - build
+
+default:
+  interruptible: true
+
+workflow:
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    - if: '$CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+$/ && $CI_COMMIT_REF_PROTECTED == "true"'
+    - when: never
+
+validate:
+  stage: validate
+  script:
+    - docker build --file Dockerfile.ci --tag "tempest-ci:$CI_COMMIT_SHA" .
+    - docker run --rm "tempest-ci:$CI_COMMIT_SHA" make test
+  after_script:
+    - docker image rm "tempest-ci:$CI_COMMIT_SHA" >/dev/null 2>&1 || true
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    - if: '$CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+$/ && $CI_COMMIT_REF_PROTECTED == "true"'
+
+build-release:
+  stage: build
+  needs: [validate]
+  script:
+    - test "$CI_COMMIT_REF_PROTECTED" = "true"
+    - docker build --file Dockerfile.ci --tag "tempest-ci:$CI_COMMIT_SHA" .
+    - docker create --name "tempest-release-$CI_JOB_ID" "tempest-ci:$CI_COMMIT_SHA" scripts/build-release.sh "$CI_COMMIT_TAG"
+    - docker start --attach "tempest-release-$CI_JOB_ID"
+    - mkdir -p dist
+    - docker cp "tempest-release-$CI_JOB_ID:/src/dist/." dist/
+  after_script:
+    - docker rm --force "tempest-release-$CI_JOB_ID" >/dev/null 2>&1 || true
+    - docker image rm "tempest-ci:$CI_COMMIT_SHA" >/dev/null 2>&1 || true
+  artifacts:
+    name: "tempest-$CI_COMMIT_TAG"
+    expire_in: 30 days
+    paths:
+      - dist/*.tar.gz
+      - dist/*.sha256
+  rules:
+    - if: '$CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+$/ && $CI_COMMIT_REF_PROTECTED == "true"'
+
+# deploy-production is intentionally absent. Add it only after a source-limited
+# forced receiver and an independently reachable production health URL exist.

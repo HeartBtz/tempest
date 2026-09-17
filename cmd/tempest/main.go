@@ -15,12 +15,11 @@ import (
 	"time"
 
 	"github.com/HeartBtz/tempest/internal/api"
+	"github.com/HeartBtz/tempest/internal/buildinfo"
 	"github.com/HeartBtz/tempest/internal/config"
 	"github.com/HeartBtz/tempest/internal/engine"
 	"github.com/HeartBtz/tempest/internal/storage"
 )
-
-var version = "0.1.0"
 
 const shutdownTimeout = 8 * time.Second
 
@@ -32,7 +31,7 @@ func main() {
 	flag.Parse()
 
 	if *showVersion {
-		fmt.Printf("Tempest ⚡ v%s\n", version)
+		fmt.Printf("Tempest ⚡ v%s\n", buildinfo.Version)
 		os.Exit(0)
 	}
 
@@ -67,7 +66,7 @@ func main() {
      ██║   ███████╗██║ ╚═╝ ██║██║     ███████╗███████║   ██║
      ╚═╝   ╚══════╝╚═╝     ╚═╝╚═╝     ╚══════╝╚══════╝   ╚═╝
                   ⚡ BitTorrent Announce Testing Dashboard`)
-	fmt.Printf("                        v%s\n\n", version)
+	fmt.Printf("                        v%s\n\n", buildinfo.Version)
 
 	config.Set(cfg)
 

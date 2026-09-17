@@ -1,6 +1,7 @@
 package api
 
 import (
+	"encoding/json"
 	"io"
 	"net"
 	"net/http"
@@ -360,5 +361,27 @@ func TestSecurityHeadersAllowCurrentInlineStyles(t *testing.T) {
 	csp := rr.Header().Get("Content-Security-Policy")
 	if !strings.Contains(csp, "script-src 'self'") || !strings.Contains(csp, "style-src 'self' 'unsafe-inline'") {
 		t.Fatalf("unexpected CSP: %q", csp)
+	}
+}
+
+func TestHealthReportsExactBuildVersion(t *testing.T) {
+	s := newTestServer(t)
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/health", nil)
+	req.Host = "localhost:8377"
+	s.HTTPServer().Handler.ServeHTTP(rr, req)
+
+	var health struct {
+		Status  string `json:"status"`
+		Version string `json:"version"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &health); err != nil {
+		t.Fatalf("decode health response: %v", err)
+	}
+	if health.Status != "ok" || health.Version != "0.1.0" {
+		t.Fatalf("health = %#v, want exact status and build version", health)
+	}
+	if cacheControl := rr.Header().Get("Cache-Control"); cacheControl != "no-store" {
+		t.Fatalf("Cache-Control = %q, want no-store", cacheControl)
 	}
 }
